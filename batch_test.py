@@ -1,9 +1,10 @@
 import time
 
 from assertions import assert_invalid, assert_unavailable
-from dtest import Tester
+from dtest import Tester, debug
 from cassandra import ConsistencyLevel, Timeout
 from cassandra.query import SimpleStatement
+from tools import new_node
 
 class TestBatch(Tester):
 
@@ -179,6 +180,49 @@ class TestBatch(Tester):
         rows = session.execute("SELECT id, writetime(firstname), writetime(lastname) FROM users")
         res = sorted(rows)
         assert [list(res[0]), list(res[1])] == [[0, 1111111111111111, 1111111111111111], [1, 1111111111111112, 1111111111111112]], res
+
+    def multidc_batchlog_cl_one_insert_test(self):
+        """
+        Test that it's possible to insert a batchlog in
+        a multidc environment with only 1 node up on each
+        DC with ConsistencyLevel ONE.
+        @jira_ticket CASSANDRA-10171
+        """
+        cluster = self.cluster
+        cluster.populate([3, 0])
+        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+        cluster.start()
+        node1 = cluster.nodelist()[0]
+
+        session = self.patient_cql_connection(node1)
+        self.create_ks(session, 'ks', 3)
+
+        node1, node2, node3 = self.cluster.nodelist()
+
+        # batchlog requires 2 nodes, so we need to create another dc and set replica 0
+        debug("Bootstrapping new node in another dc")
+        node4 = new_node(self.cluster, data_center='dc2')
+        node4.start(wait_other_notice=True, wait_for_binary_proto=True)
+
+        debug("Creating a new keyspace with NTS")
+        session.execute(
+            ("CREATE KEYSPACE IF NOT EXISTS ks2 WITH replication = "
+             "{'class': 'NetworkTopologyStrategy', 'dc1': 3, 'dc2': 0}")
+        )
+        session.execute("CREATE TABLE ks2.t (id int PRIMARY KEY, v int, v2 text, v3 decimal)")
+        session.cluster.control_connection.wait_for_schema_agreement()
+
+        debug('Shutdown node2')
+        node2.stop(wait_other_notice=True)
+        debug('Shutdown node3')
+        node3.stop(wait_other_notice=True)
+
+        debug('Test will fail with UnavailableException if data cannot be inserted')
+        for i in xrange(1000):
+            session.execute("BEGIN BATCH " +
+                            "INSERT INTO ks2.t (id, v, v2, v3) VALUES ({v}, {v}, 'a', 3.0) ".format(v=i) +
+                            "INSERT INTO ks2.t (id, v, v2, v3) VALUES ({v}, {v}, 'a', 3.0) ".format(v=1000+i) +
+                            "APPLY BATCH")
 
     def assert_timedout(self, session, query, cl, acknowledged_by=None,
                         received_responses=None):
