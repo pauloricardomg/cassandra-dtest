@@ -3,8 +3,9 @@ import re
 from nose.tools import assert_equal, assert_in
 
 from cassandra import cqltypes
-from dtest import Tester
+from dtest import Tester, debug
 from tools import since, require
+import time
 
 
 def establish_indexes_table(version, session, table_name_prefix=""):
@@ -526,7 +527,13 @@ class TestSchemaMetadata(Tester):
         self.assertEqual(0, len(self._keyspace_meta().indexes))
         self.session.execute("create table born_to_die (id uuid primary key, name varchar)")
         self.session.execute("create index ix_born_to_die_name on born_to_die(name)")
-
+        self._keyspace_meta()
+        time.sleep(60)
+        self._keyspace_meta()
+        self._keyspace_meta()
+        self._keyspace_meta()
+        debug(self._keyspace_meta().tables)
+        debug(self._keyspace_meta().indexes)
         self.assertEqual(1, len(self._keyspace_meta().indexes))
         ix_meta = self._keyspace_meta().indexes['ix_born_to_die_name']
         self.assertEqual('COMPOSITES', ix_meta.index_type)
