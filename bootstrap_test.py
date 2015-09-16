@@ -5,12 +5,22 @@ import shutil
 import subprocess
 import tempfile
 import re
+from threading import Thread
 from dtest import Tester, debug
 from tools import new_node, query_c1c2, since, KillOnBootstrap, InterruptBootstrap
 from assertions import assert_almost_equal
 from ccmlib.node import NodeError
 from cassandra import ConsistencyLevel
 from cassandra.concurrent import execute_concurrent_with_args
+
+class RunStressDuringBootStrap(Thread):
+    def __init__(self, node):
+        Thread.__init__(self)
+        self.node = node
+
+    def run(self):
+        self.node.watch_log_for("Prepare completed")
+        self.node.stress(['write', 'n=50000', '-schema', 'replication(factor=2)'])
 
 
 class TestBootstrap(Tester):
@@ -148,6 +158,33 @@ class TestBootstrap(Tester):
         # check if we skipped already retrieved ranges
         node3.watch_log_for("already available. Skipping streaming.")
         node3.watch_log_for("Resume complete", from_mark=mark)
+        rows = session.execute("SELECT bootstrapped FROM system.local WHERE key='local'")
+        assert rows[0][0] == 'COMPLETED', rows[0][0]
+
+    @since('2.1')
+    def bootstrap_stream_timeout_test(self):
+        """Test resuming bootstrap after data streaming failure"""
+
+        cluster = self.cluster
+        cluster.set_configuration_options(values={'stream_throughput_outbound_megabits_per_sec': 1})
+        # cassandra.test.streaming_socket_error_chance will throw a socket exception
+        # with 50% chance during a streaming session
+        cluster.populate(2)
+        node1, node2 = cluster.nodelist()
+        node1.start()
+        node2.start(wait_other_notice=True, wait_for_binary_proto=True,
+                    jvm_args=["-Dcassandra.test.streaming_socket_error_chance=0.5"])
+
+        node1.stress(['write', 'n=100000', '-schema', 'replication(factor=2)'])
+        node1.flush()
+
+        # start bootstrapping node3 and wait for streaming
+        node3 = new_node(cluster)
+        node3.start()
+
+        # wait for node3 ready to query
+        node3.watch_log_for("Starting listening for CQL clients")
+        session = self.exclusive_cql_connection(node3)
         rows = session.execute("SELECT bootstrapped FROM system.local WHERE key='local'")
         assert rows[0][0] == 'COMPLETED', rows[0][0]
 
