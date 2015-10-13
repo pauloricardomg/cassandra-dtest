@@ -3607,7 +3607,7 @@ class TestCQL(UpgradeTester):
         cursor.execute("CREATE INDEX ON test(s)")
         cursor.execute("CREATE INDEX ON test(m)")
 
-        time.sleep(5.0)
+        time.sleep(300)
 
         for is_upgraded, cursor in self.do_upgrade(cursor):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
