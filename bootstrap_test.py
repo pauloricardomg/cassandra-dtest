@@ -88,6 +88,35 @@ class TestBootstrap(Tester):
         assert_almost_equal(size1, size2, error=0.3)
         assert_almost_equal(float(initial_size - empty_size), 2 * (size1 - float(empty_size)))
 
+    def sequential_connect_test(self):
+        """
+        @jira_ticket CASSANDRA-6992
+        Test that connections are stablished sequentially during bootstrap
+        """
+        cluster = self.cluster
+        cluster.populate(2)
+
+        cluster.start(wait_other_notice=True)
+
+        node1 = cluster.nodelist()[0]
+        session = self.patient_cql_connection(node1)
+        self.create_ks(session, 'ks', 1)
+        self.create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
+
+        keys = 10000
+        insert_statement = session.prepare("INSERT INTO ks.cf (key, c1, c2) VALUES (?, 'value1', 'value2')")
+        execute_concurrent_with_args(session, insert_statement, [['k%d' % k] for k in range(keys)])
+
+        cluster.flush()
+
+        # Bootstraping a new node
+        node3 = new_node(cluster)
+        node3.start()
+
+        node3.watch_log_for('Connecting next session .* with 127.0.0.1.', timeout=60, filename="debug.log")
+        node3.watch_log_for('Connecting next session .* with 127.0.0.2.', timeout=60, filename="debug.log")
+        node3.watch_log_for('Finished connecting all sessions', timeout=60, filename="debug.log")
+
     def read_from_bootstrapped_node_test(self):
         """Test bootstrapped node sees existing data, eg. CASSANDRA-6648"""
         cluster = self.cluster
