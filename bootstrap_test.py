@@ -108,6 +108,46 @@ class TestBootstrap(Tester):
         new_rows = list(session.execute("SELECT * FROM %s" % (stress_table,)))
         self.assertEquals(original_rows, new_rows)
 
+    def failed_bootstrap_test(self):
+        """
+        @jira_ticket CASSANDRA-9294
+        Test bootstrap error is logged correctly
+        """
+
+        cluster = self.cluster
+        cluster.set_configuration_options(values={'stream_throughput_outbound_megabits_per_sec': 1})
+        cluster.populate(2).start(wait_other_notice=True)
+
+        node1, node2 = cluster.nodelist()
+        node1.stress(['write', 'n=100K', '-schema', 'replication(factor=2)'])
+        node1.flush()
+
+        # kill node1 in the middle of streaming to let it fail
+        t1 = InterruptBootstrap(node1)
+        t1.start()
+        # kill node2 in the middle of streaming to let it fail
+        t2 = InterruptBootstrap(node2)
+        t2.start()
+
+        # start bootstrapping node3 and wait for streaming
+        node3 = new_node(cluster)
+        # keep timeout low so that test won't hang
+        node3.set_configuration_options(values={'streaming_socket_timeout_in_ms': 1000})
+        try:
+            node3.start()
+        except NodeError:
+            pass  # node doesn't start as expected
+        t1.join()
+        t2.join()
+
+        line, obj = node3.watch_log_for("Stream failed")
+        debug(line)
+
+        l = node3.grep_log("Failed stream session with /127.0.0.*\(Streaming error ocurred. Caused by .*: .*")
+
+        debug(l)
+        self.assertNotEqual(len(l), 0)
+
     @since('2.2')
     def resumable_bootstrap_test(self):
         """Test resuming bootstrap after data streaming failure"""
