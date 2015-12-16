@@ -1017,43 +1017,100 @@ class CqlshCopyTest(Tester):
             )""")
 
         self.tempfile = NamedTemporaryFile(delete=False)
-        err_file = NamedTemporaryFile(delete=True)
 
-        def do_test(num_chunks, chunk_size, num_failing_per_chunk):
-            if os.path.isfile(err_file.name):
-                self.session.execute("TRUNCATE testparseerrors")
-                os.unlink(err_file.name)
-
+        def do_test(num_chunks, chunk_size, num_failing_per_chunk, err_file):
             invalid_rows = []
             valid_rows = []
             with open(self.tempfile.name, 'w') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=['a', 'b', 'c'])
                 for i in xrange(num_chunks):
                     for k in xrange(chunk_size):
-                        if k < num_failing_per_chunk:
-                            writer.writerow({'a': i, 'b': k, 'c': 'abc'})  # invalid
-                            invalid_rows.append([i, k, 'abc'])
+                        if k < num_failing_per_chunk:  # invalid
+                            if i == 0 and k == 0:  # fail on a primary key (only once)
+                                writer.writerow({'a': 'bb', 'b': k, 'c': 1.0})
+                                invalid_rows.append(['bb', k, '1.0'])
+                            else:  # fail on a value
+                                writer.writerow({'a': i, 'b': k, 'c': 'abc'})
+                                invalid_rows.append([i, k, 'abc'])
                         else:
                             writer.writerow({'a': i, 'b': k, 'c': 2.0})  # valid
                             valid_rows.append([i, k, 2.0])
                 csvfile.close
 
-            debug("Importing csv file {} with err file {} and {}/{}/{}"
-                  .format(self.tempfile.name, err_file.name, num_chunks, chunk_size, num_failing_per_chunk))
-            self.node1.run_cqlsh(cmds="COPY ks.testparseerrors FROM '{}' WITH ERRFILE='{}' AND CHUNKSIZE='{}'"
-                                 .format(self.tempfile.name, err_file.name, chunk_size))
+            err_file_name = err_file.name if err_file else 'import_ks_testparseerrors.err'
+            self.session.execute("TRUNCATE testparseerrors")
+
+            debug("Importing csv file {} with err_file {} and {}/{}/{}"
+                  .format(self.tempfile.name, err_file_name, num_chunks, chunk_size, num_failing_per_chunk))
+            cmd = "COPY ks.testparseerrors FROM '{}' WITH CHUNKSIZE='{}'".format(self.tempfile.name, chunk_size)
+            if err_file:
+                cmd += " AND ERRFILE='{}'".format(err_file.name)
+            self.node1.run_cqlsh(cmds=cmd)
 
             debug('Sorting')
             results = sorted(rows_to_list(self.session.execute("SELECT * FROM ks.testparseerrors")))
             debug('Checking valid rows')
             self.assertItemsEqual(valid_rows, results)
             debug('Checking invalid rows')
-            self.assertCsvResultEqual(err_file.name, invalid_rows)
+            self.assertCsvResultEqual(err_file_name, invalid_rows)
 
-        do_test(100, 2, 1)
-        do_test(10, 50, 1)
-        do_test(10, 100, 10)
-        do_test(10, 100, 100)
+            os.unlink(err_file_name)
+
+        do_test(100, 2, 1, NamedTemporaryFile(delete=False))
+        do_test(100, 2, 1, None)
+        do_test(10, 50, 1, NamedTemporaryFile(delete=False))
+        do_test(10, 100, 10, NamedTemporaryFile(delete=False))
+        do_test(10, 100, 100, NamedTemporaryFile(delete=False))
+
+    def test_reading_with_wrong_number_of_columns(self):
+        """
+        Test importing a CSV file where not all rows have the correct number of columns:
+
+        - create a table
+        - create a csv file with some invalid rows
+        - import the csv file
+        - check that the valid rows are imported and the invalid rows are saved in a bad file.
+
+        @jira_ticket CASSANDRA-9303
+        """
+        self.prepare()
+        self.session.execute("""
+            CREATE TABLE testwrongnumcols (
+                a int,
+                b int,
+                c float,
+                d float,
+                e float,
+                PRIMARY KEY (a, b)
+            )""")
+
+        self.tempfile = NamedTemporaryFile(delete=False)
+        err_file = NamedTemporaryFile(delete=True)
+
+        invalid_rows = []
+        valid_rows = []
+        with open(self.tempfile.name, 'w') as csvfile:  # c, d is missing
+            writer = csv.DictWriter(csvfile, fieldnames=['a', 'b', 'e'])
+            writer.writerow({'a': 0, 'b': 0, 'e': 1.0})
+            invalid_rows.append([0, 0, '1.0'])
+
+            writer = csv.DictWriter(csvfile, fieldnames=['a', 'b', 'c', 'd', 'e'])
+            for i in xrange(1, 100):
+                writer.writerow({'a': i, 'b': i, 'c': 2.0, 'd': 3.0, 'e': 4.0})
+                valid_rows.append([i, i, 2.0, 3.0, 4.0])
+
+            csvfile.close
+
+        debug("Importing csv file {} with err_file {}".format(self.tempfile.name, err_file.name))
+        cmd = "COPY ks.testwrongnumcols FROM '{}' WITH ERRFILE='{}'".format(self.tempfile.name, err_file.name)
+        self.node1.run_cqlsh(cmds=cmd, show_output=True)
+
+        debug('Sorting')
+        results = sorted(rows_to_list(self.session.execute("SELECT * FROM ks.testwrongnumcols")))
+        debug('Checking valid rows')
+        self.assertItemsEqual(valid_rows, results)
+        debug('Checking invalid rows')
+        self.assertCsvResultEqual(err_file.name, invalid_rows)
 
     def test_reading_with_multiple_files(self):
         """
@@ -1583,7 +1640,18 @@ class CqlshCopyTest(Tester):
                                                     Decimal("-1234.56"), -1234.56, -1234.56])
             self.session.execute(insert_statement, [1000000, 0, 0, 0, Decimal(0), 0, 0])
 
-            expected_vals = [
+            # comma as thousands sep and dot as decimal sep
+            expected_vals_usual = [
+                ['0', '10', '10', '10', '10', '10', '10'],
+                ['1', '1,000', '1,000', '1,000', '5.5', '5.5', '5.12346'],
+                ['2', '1,000,000', '1,000,000', '1,000,000', '0.001', '0.001', '0.001'],
+                ['3', '1,000,000,005', '1,000,000,005', '1,000,000,005', '1,234.56', '1,234.56006', '123,456,789.56'],
+                ['4', '-1,000,000,005', '-1,000,000,005', '-1,000,000,005', '-1,234.56', '-1,234.56006', '-1,234.56'],
+                ['1,000,000', '0', '0', '0', '0', '0', '0']
+            ]
+
+            # dot as thousands sep and comma as decimal sep
+            expected_vals_inverted = [
                 ['0', '10', '10', '10', '10', '10', '10'],
                 ['1', '1.000', '1.000', '1.000', '5,5', '5,5', '5,12346'],
                 ['2', '1.000.000', '1.000.000', '1.000.000', '0,001', '0,001', '0,001'],
@@ -1618,7 +1686,20 @@ class CqlshCopyTest(Tester):
                                                     Decimal("-1234.56"), -1234.56, -1234.56])
             self.session.execute(insert_statement, [1000000, 0, 0, 0, Decimal(0), 0, 0])
 
-            expected_vals = [
+            # comma as thousands sep and dot as decimal sep
+            expected_vals_usual = [
+                ['0', '10', '10', '10', '10', '10', '10'],
+                ['1', '128', '256', '1,000', '1,000', '1,000', '5.5', '5.5', '5.12346'],
+                ['2', '128', '256', '1,000,000', '1,000,000', '1,000,000', '0.001', '0.001', '0.001'],
+                ['3', '128', '256', '1,000,000,005', '1,000,000,005', '1,000,000,005',
+                 '1,234.56', '1,234.56006', '123,456,789.56'],
+                ['4', '128', '256', '-1,000,000,005', '-1,000,000,005', '-1,000,000,005',
+                 '-1,234.56', '-1,234.56006', '-1,234.56'],
+                ['1,000,000', '0', '0', '0', '0', '0', '0', '0', '0']
+            ]
+
+            # dot as thousands sep and comma as decimal sep
+            expected_vals_inverted = [
                 ['0', '10', '10', '10', '10', '10', '10'],
                 ['1', '128', '256', '1.000', '1.000', '1.000', '5,5', '5,5', '5,12346'],
                 ['2', '128', '256', '1.000.000', '1.000.000', '1.000.000', '0,001', '0,001', '0,001'],
@@ -1630,23 +1711,30 @@ class CqlshCopyTest(Tester):
             ]
 
         self.tempfile = NamedTemporaryFile(delete=False)
-        debug('Exporting to csv file: {name}'.format(name=self.tempfile.name))
-        self.node1.run_cqlsh(cmds="COPY ks.testnumberseps TO '{name}' WITH THOUSANDSSEP='.' AND DECIMALSEP=','"
-                             .format(name=self.tempfile.name))
 
-        exported_results = list(self.session.execute("SELECT * FROM testnumberseps"))
-        self.maxDiff = None
-        self.assertItemsEqual(expected_vals, list(csv_rows(self.tempfile.name)))
+        def do_test(expected_vals, thousands_sep, decimal_sep):
+            debug('Exporting to csv file: {} with thousands_sep {} and decimal_sep {}'
+                  .format(self.tempfile.name, thousands_sep, decimal_sep))
+            self.node1.run_cqlsh(cmds="COPY ks.testnumberseps TO '{}' WITH THOUSANDSSEP='{}' AND DECIMALSEP='{}'"
+                                 .format(self.tempfile.name, thousands_sep, decimal_sep))
 
-        debug('Importing from csv file: {name}'.format(name=self.tempfile.name))
-        self.session.execute('TRUNCATE ks.testnumberseps')
-        self.node1.run_cqlsh(cmds="COPY ks.testnumberseps FROM '{name}' WITH THOUSANDSSEP='.' AND DECIMALSEP=','"
-                             .format(name=self.tempfile.name))
+            exported_results = list(self.session.execute("SELECT * FROM testnumberseps"))
+            self.maxDiff = None
+            self.assertItemsEqual(expected_vals, list(csv_rows(self.tempfile.name)))
 
-        imported_results = list(self.session.execute("SELECT * FROM testnumberseps"))
-        self.assertEqual(len(expected_vals), len(imported_results))
-        self.assertEqual(self.result_to_csv_rows(exported_results),  # we format as if we were comparing to csv
-                         self.result_to_csv_rows(imported_results))  # to overcome loss of precision in the import
+            debug('Importing from csv file: {} with thousands_sep {} and decimal_sep {}'
+                  .format(self.tempfile.name, thousands_sep, decimal_sep))
+            self.session.execute('TRUNCATE ks.testnumberseps')
+            self.node1.run_cqlsh(cmds="COPY ks.testnumberseps FROM '{}' WITH THOUSANDSSEP='{}' AND DECIMALSEP='{}'"
+                                 .format(self.tempfile.name, thousands_sep, decimal_sep))
+
+            imported_results = list(self.session.execute("SELECT * FROM testnumberseps"))
+            self.assertEqual(len(expected_vals), len(imported_results))
+            self.assertEqual(self.result_to_csv_rows(exported_results),  # we format as if we were comparing to csv
+                             self.result_to_csv_rows(imported_results))  # to overcome loss of precision in the import
+
+        do_test(expected_vals_usual, ',', '.')
+        do_test(expected_vals_inverted, '.', ',')
 
     def test_round_trip_with_num_processes(self):
         """
@@ -1710,8 +1798,7 @@ class CqlshCopyTest(Tester):
 
         debug('Exporting to csv file: {}'.format(self.tempfile.name))
         self.node1.run_cqlsh(cmds="COPY {} TO '{}' WITH RATEFILE='{}' AND REPORTFREQUENCY='{}'"
-                             .format(stress_table, self.tempfile.name, ratefile.name, report_frequency),
-                             show_output=True, cqlsh_options=['--debug'])
+                             .format(stress_table, self.tempfile.name, ratefile.name, report_frequency))
 
         # check all records were exported
         self.assertEqual(num_rows, len(open(self.tempfile.name).readlines()))
