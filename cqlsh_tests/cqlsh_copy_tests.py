@@ -729,7 +729,7 @@ class CqlshCopyTest(Tester):
             self.session.execute('TRUNCATE ks.testskipcols')
             debug("Importing csv file {} with skipcols '{}'".format(self.tempfile, skip_cols))
             out, err = self.node1.run_cqlsh(cmds="COPY ks.testskipcols FROM '{}' WITH SKIPCOLS = '{}'"
-                                            .format(self.tempfile.name, skip_cols), return_output=True)
+                                            .format(self.tempfile.name, skip_cols), return_output=True, cqlsh_options=['--debug'])
             debug(out)
             self.assertItemsEqual(expected_results, rows_to_list(self.session.execute("SELECT * FROM ks.testskipcols")))
 
@@ -784,55 +784,6 @@ class CqlshCopyTest(Tester):
         do_test('b', [[1, 1, 1, 1, 1], [2, 1, 1, 1, 1]])
         do_test('b', [[1, 1, 2, 2, 2], [2, 1, 2, 2, 2]])
         do_test('e', [[1, 2, 3, 3, 2], [2, 2, 3, 3, 2]])
-
-    def test_writing_with_skip_cols(self):
-        """
-        Test writing a CSV file but skipping some columns:
-
-        - create a table
-        - populate the table with all column values
-        - export the table to the csv file with skip_columns
-        - check only the columns that were now skipped are in the csv file
-
-        @jira_ticket CASSANDRA-9303
-        """
-        self.tempfile = NamedTemporaryFile(delete=False)
-        self.prepare()
-        self.session.execute("""
-            CREATE TABLE testskipcols (
-                a int primary key,
-                b int,
-                c int,
-                d int,
-                e int
-            )""")
-
-        insert_statement = self.session.prepare("INSERT INTO testskipcols (a, b, c, d, e) VALUES (?, ?, ?, ?, ?)")
-        args = [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]]
-        execute_concurrent_with_args(self.session, insert_statement, args)
-
-        def do_test(skip_cols, expected_values):
-            self.maybeDeleteTempFile()
-
-            debug("Exporting to csv file: {} with skip cols '{}'".format(self.tempfile.name, skip_cols))
-            self.node1.run_cqlsh(cmds="COPY ks.testskipcols TO '{}' WITH SKIPCOLS = '{}'"
-                                 .format(self.tempfile.name, skip_cols))
-
-            if os.path.isfile(self.tempfile.name):
-                with open(self.tempfile.name, 'r') as csvfile:
-                    csv_values = list(csv.reader(csvfile))
-            else:
-                csv_values = []
-
-            self.assertItemsEqual(expected_values, csv_values)
-
-        do_test('c, d ,e', [['1', '2'], ['6', '7']])
-        do_test('a,', [['2', '3', '4', '5'], ['7', '8', '9', '10']])
-        do_test('a', [['2', '3', '4', '5'], ['7', '8', '9', '10']])
-        do_test('c', [['1', '2', '4', '5'], ['6', '7', '9', '10']])
-        do_test(',e', [['1', '2', '3', '4'], ['6', '7', '8', '9']])
-        do_test('e', [['1', '2', '3', '4'], ['6', '7', '8', '9']])
-        do_test('a,b,c,d,e', [])
 
     def test_writing_with_token_boundaries(self):
         """
@@ -1042,7 +993,7 @@ class CqlshCopyTest(Tester):
 
             debug("Importing csv file {} with err_file {} and {}/{}/{}"
                   .format(self.tempfile.name, err_file_name, num_chunks, chunk_size, num_failing_per_chunk))
-            cmd = "COPY ks.testparseerrors FROM '{}' WITH CHUNKSIZE='{}'".format(self.tempfile.name, chunk_size)
+            cmd = "COPY ks.testparseerrors FROM '{}' WITH CHUNKSIZE={}".format(self.tempfile.name, chunk_size)
             if err_file:
                 cmd += " AND ERRFILE='{}'".format(err_file.name)
             self.node1.run_cqlsh(cmds=cmd)
@@ -1054,13 +1005,19 @@ class CqlshCopyTest(Tester):
             debug('Checking invalid rows')
             self.assertCsvResultEqual(err_file_name, invalid_rows)
 
-            os.unlink(err_file_name)
+        try:
+            do_test(100, 2, 1, NamedTemporaryFile(delete=False))
+            do_test(10, 50, 1, NamedTemporaryFile(delete=False))
+            do_test(10, 100, 10, NamedTemporaryFile(delete=False))
+            do_test(10, 100, 100, NamedTemporaryFile(delete=False))
 
-        do_test(100, 2, 1, NamedTemporaryFile(delete=False))
-        do_test(100, 2, 1, None)
-        do_test(10, 50, 1, NamedTemporaryFile(delete=False))
-        do_test(10, 100, 10, NamedTemporaryFile(delete=False))
-        do_test(10, 100, 100, NamedTemporaryFile(delete=False))
+            # at least two default files to make sure old default err file gets renamed to .YYYYMMDD_HHMMSS
+            do_test(100, 2, 1, None)
+            do_test(10, 50, 1, None)
+        finally:
+            for default_err_file in glob.glob('import_ks_testparseerrors.err*'):
+                debug('Removing {}'.format(default_err_file))
+                os.unlink(default_err_file)
 
     def test_reading_with_wrong_number_of_columns(self):
         """
@@ -1835,29 +1792,16 @@ class CqlshCopyTest(Tester):
         stress_table = 'keyspace1.standard1'
         self.node1.stress(['write', 'n=1K', '-rate', 'threads=50'])
 
-        # this creates a temporary configuration file with 3 sections: a common section (default section name),
-        # a COPY FROM section and a COPY TO section
-        configfile = NamedTemporaryFile(delete=True)
-        debug('Creating config file {}'.format(configfile.name))
-        config_lines = [
-            ';common section',
-            '[{}]'.format(stress_table),
-            'header = True',
-            'jobs = 10',
-            'maxattempts = 10',
-            ';copy from section',
-            '[{}.from]'.format(stress_table),
-            'SKIPROWS = 10',
-            'jobs = 11',
-            ';copy to section',
-            '[{}.to]'.format(stress_table),
-            'PAGETIMEOUT = 2000',
-            'jobs = 12'
-        ]
-        with open(configfile.name, 'wb') as config:
-            for line in config_lines:
-                config.write(line + os.linesep)
-            config.close()
+        def create_config_file(config_lines):
+            config_file = NamedTemporaryFile(delete=False)
+            debug('Creating config file {}'.format(config_file.name))
+
+            with open(config_file.name, 'wb') as config:
+                for line in config_lines:
+                    config.write(line + os.linesep)
+                config.close()
+
+            return config_file.name
 
         def extract_options(out):
             prefix = 'Using options: '
@@ -1873,44 +1817,49 @@ class CqlshCopyTest(Tester):
             for k, v in expected_options:
                 self.assertEqual(v, d[k])
 
-        def do_test(cmds, expected_options):
-            debug(cmds)
-            out, _ = self.node1.run_cqlsh(cmds, return_output=True, cqlsh_options=['--debug'])
+        def do_test(config_lines, expected_options):
+            config_file = create_config_file(config_lines)
+
+            cmd = "COPY {} {} '{}'".format(stress_table, direction, self.tempfile.name)
+            if not use_default:
+                cmd += " WITH CONFIGFILE = '{}'".format(config_file)
+
+            cqlsh_options = ['--debug']
+            if use_default:
+                cqlsh_options.append('--cqlshrc={}'.format(config_file))
+
+            debug('{} with options {}'.format(cmd, cqlsh_options))
+            out, _ = self.node1.run_cqlsh(cmds=cmd, return_output=True, cqlsh_options=cqlsh_options)
+            debug(out)
             check_options(out, expected_options)
 
-        do_test("COPY {} TO '{}' with CONFIGFILE = '{}'"
-                .format(stress_table, self.tempfile.name, configfile.name),
-                [('header', 'True'), ('jobs', '10'), ('maxattempts', '10')])
+        for use_default in [True, False]:
+            for direction in ['TO', 'FROM']:
+                do_test(['[copy]', 'header = True', 'maxattempts = 10'],
+                        [('header', 'True'), ('maxattempts', '10')])
 
-        do_test("COPY {} FROM '{}' with CONFIGFILE = '{}'"
-                .format(stress_table, self.tempfile.name, configfile.name),
-                [('header', 'True'), ('jobs', '10'), ('maxattempts', '10')])
+                do_test(['[copy]', 'header = True', 'maxattempts = 10',
+                         '[copy:{}]'.format(stress_table), 'maxattempts = 9'],
+                        [('header', 'True'), ('maxattempts', '9')])
 
-        do_test("COPY {} TO '{}' with CONFIGFILE = '{}' AND jobs = '9'"
-                .format(stress_table, self.tempfile.name, configfile.name),
-                [('header', 'True'), ('jobs', '9'), ('maxattempts', '10')])
+                do_test(['[copy]', 'header = True', 'maxattempts = 10',
+                         '[copy-from]', 'maxattempts = 9',
+                         '[copy-to]', 'maxattempts = 8'],
+                        [('header', 'True'), ('maxattempts', '8' if direction == 'TO' else '9')])
 
-        do_test("COPY {} FROM '{}' with CONFIGFILE = '{}' AND jobs = '9'"
-                .format(stress_table, self.tempfile.name, configfile.name),
-                [('header', 'True'), ('jobs', '9'), ('maxattempts', '10')])
+                do_test(['[copy]', 'header = True', 'maxattempts = 10',
+                         '[copy-from]', 'maxattempts = 9',
+                         '[copy-to]', 'maxattempts = 8',
+                         '[copy:{}]'.format(stress_table), 'maxattempts = 7'],
+                        [('header', 'True'), ('maxattempts', '7')])
 
-        do_test("COPY {table} TO '{file}' with CONFIGFILE = '{config_file}' AND CONFIGSECTIONS = '{table},{table}.to'"
-                .format(table=stress_table, file=self.tempfile.name, config_file=configfile.name),
-                [('header', 'True'), ('jobs', '12'), ('maxattempts', '10'), ('pagetimeout', '2000')])
-
-        do_test("COPY {table} FROM '{file}' with CONFIGFILE = '{cfile}' AND CONFIGSECTIONS = '{table},{table}.from'"
-                .format(table=stress_table, file=self.tempfile.name, cfile=configfile.name),
-                [('header', 'True'), ('jobs', '11'), ('maxattempts', '10'), ('skiprows', '10')])
-
-        do_test("COPY {table} TO '{file}' with CONFIGFILE = '{config_file}' AND CONFIGSECTIONS = '{table},{table}.to'"
-                " AND jobs = '9'"
-                .format(table=stress_table, file=self.tempfile.name, config_file=configfile.name),
-                [('header', 'True'), ('jobs', '9'), ('maxattempts', '10'), ('pagetimeout', '2000')])
-
-        do_test("COPY {table} FROM '{file}' with CONFIGFILE = '{cfile}' AND CONFIGSECTIONS = '{table},{table}.from'"
-                " AND jobs = '9'"
-                .format(table=stress_table, file=self.tempfile.name, cfile=configfile.name),
-                [('header', 'True'), ('jobs', '9'), ('maxattempts', '10'), ('skiprows', '10')])
+                do_test(['[copy]', 'header = True', 'maxattempts = 10',
+                         '[copy-from]', 'maxattempts = 9',
+                         '[copy-to]', 'maxattempts = 8',
+                         '[copy:{}]'.format(stress_table), 'maxattempts = 7',
+                         '[copy-from:{}]'.format(stress_table), 'maxattempts = 6',
+                         '[copy-to:{}]'.format(stress_table), 'maxattempts = 5'],
+                        [('header', 'True'), ('maxattempts', '5' if direction == 'TO' else '6')])
 
     def test_wrong_number_of_columns(self):
         """
@@ -2053,9 +2002,12 @@ class CqlshCopyTest(Tester):
         os.unlink(commandfile.name)
 
     def _test_bulk_round_trip(self, nodes, partitioner,
-                              num_operations, profile=None, stress_table='keyspace1.standard1',
-                              page_size=1000, page_timeout=10, configuration_options=None,
-                              skip_count_checks=False):
+                              num_operations, profile=None,
+                              stress_table='keyspace1.standard1',
+                              configuration_options=None,
+                              skip_count_checks=False,
+                              copy_to_options={'PAGETIMEOUT': 10, 'PAGESIZE': 1000},
+                              copy_from_options=None):
         """
         Test exporting a large number of rows into a csv file.
 
@@ -2083,18 +2035,25 @@ class CqlshCopyTest(Tester):
 
         debug('Exporting to csv file: {}'.format(self.tempfile.name))
         start = datetime.datetime.now()
-        self.node1.run_cqlsh(cmds="COPY {} TO '{}' WITH PAGETIMEOUT='{}' AND PAGESIZE='{}'"
-                             .format(stress_table, self.tempfile.name, page_timeout, page_size))
+        cmd = "COPY {} TO '{}'".format(stress_table, self.tempfile.name)
+        if copy_to_options:
+            cmd += ' WITH ' + ' AND '.join('{} = {}'.format(k, v) for k, v in copy_to_options.iteritems())
+        debug(cmd)
+        self.node1.run_cqlsh(cmds=cmd, show_output=True, cqlsh_options=['--debug'])
         debug("COPY TO took {} to export {} records".format(datetime.datetime.now() - start, num_records))
 
         # check all records were exported
-        self.assertEqual(num_records, sum(1 for line in open(self.tempfile.name)))
+        self.assertEqual(num_records, sum(1 for _ in open(self.tempfile.name)))
 
         self.session.execute("TRUNCATE {}".format(stress_table))
 
         debug('Importing from csv file: {}'.format(self.tempfile.name))
         start = datetime.datetime.now()
-        self.node1.run_cqlsh(cmds="COPY {} FROM '{}'".format(stress_table, self.tempfile.name))
+        cmd = "COPY {} FROM '{}'".format(stress_table, self.tempfile.name)
+        if copy_from_options:
+            cmd += ' WITH ' + ' AND '.join('{} = {}'.format(k, v) for k, v in copy_from_options.iteritems())
+        debug(cmd)
+        self.node1.run_cqlsh(cmds=cmd, show_output=True, cqlsh_options=['--debug'])
         debug("COPY FROM took {} to import {} records".format(datetime.datetime.now() - start, num_records))
 
         if not skip_count_checks:
@@ -2104,6 +2063,7 @@ class CqlshCopyTest(Tester):
         # we could export again and count the number of records exported but we just assume everything is fine
         # if we get no errors when importing, this case is only for testing the back-off policy
         # (test_bulk_round_trip_with_timeouts)
+
     @freshCluster()
     def test_bulk_round_trip_default(self):
         """
@@ -2122,7 +2082,8 @@ class CqlshCopyTest(Tester):
         """
         self._test_bulk_round_trip(nodes=3, partitioner="murmur3", num_operations=10000,
                                    profile=os.path.join(os.path.dirname(os.path.realpath(__file__)), 'blogposts.yaml'),
-                                   stress_table='stresscql.blogposts', page_timeout=60)
+                                   stress_table='stresscql.blogposts',
+                                   copy_to_options={'PAGETIMEOUT': 60, 'PAGESIZE': 1000})
 
     @freshCluster()
     def test_bulk_round_trip_with_timeouts(self):
@@ -2134,9 +2095,22 @@ class CqlshCopyTest(Tester):
         @jira_ticket CASSANDRA-9302
         """
         self._test_bulk_round_trip(nodes=1, partitioner="murmur3", num_operations=100000,
-                                   configuration_options={'range_request_timeout_in_ms': '300',
-                                                          'write_request_timeout_in_ms': '200'},
+                                   configuration_options={'range_request_timeout_in_ms': '200',
+                                                          'write_request_timeout_in_ms': '100'},
+                                   copy_to_options={'PAGETIMEOUT': 60, 'PAGESIZE': 1000},
                                    skip_count_checks=True)
+
+
+    @freshCluster()
+    def test_bulk_round_trip_with_low_ingestrate(self):
+        """
+        Test bulk import with default stress import (one row per operation) and a low
+        ingestrate of only 1500 rows per second.
+
+        @jira_ticket CASSANDRA-9303
+        """
+        self._test_bulk_round_trip(nodes=3, partitioner="murmur3", num_operations=10000,
+                                   copy_from_options={'INGESTRATE': 1500})
 
     @known_failure(failure_source='cassandra',
                    jira_url='https://issues.apache.org/jira/browse/CASSANDRA-10858')
@@ -2284,6 +2258,9 @@ class CqlshCopyTest(Tester):
         We set a batch id that will cause a batch to fail fewer times than the maximum number of attempts,
         therefore we expect this COPY TO job to succeed.
 
+        We also set a low ingest rate to ensure we exercise the code path that might split a retry if it
+        exceeds the intest rate.
+
         @jira_ticket CASSANDRA-9302
         """
         num_records = 1000
@@ -2299,10 +2276,10 @@ class CqlshCopyTest(Tester):
 
         self.session.execute("TRUNCATE {}".format(stress_table))
 
-        failures = {'failing_batch': {'id': 30, 'failures': 3}}
+        failures = {'failing_batch': {'id': 3, 'failures': 3}}
         os.environ['CQLSH_COPY_TEST_FAILURES'] = json.dumps(failures)
         debug('Importing from csv file {} with {}'.format(self.tempfile.name, os.environ['CQLSH_COPY_TEST_FAILURES']))
-        out, err = self.node1.run_cqlsh(cmds="COPY {} FROM '{}' WITH CHUNKSIZE='1' AND MAXATTEMPTS='5'"
+        out, err = self.node1.run_cqlsh(cmds="COPY {} FROM '{}' WITH CHUNKSIZE=100 AND MAXATTEMPTS=5 AND INGESTRATE=101"
                                         .format(stress_table, self.tempfile.name), return_output=True)
         debug(out)
         debug(err)
