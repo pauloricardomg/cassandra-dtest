@@ -17,14 +17,11 @@ from cassandra.util import SortedSet
 from ccmlib.common import is_win
 
 from cqlsh_tools import (DummyColorMap, assert_csvs_items_equal, csv_rows,
-                         monkeypatch_driver, random_list,
-                         strip_timezone_if_time_string, unmonkeypatch_driver,
-                         write_rows_to_csv)
+                         monkeypatch_driver, random_list, unmonkeypatch_driver, write_rows_to_csv)
 from dtest import Tester, canReuseCluster, freshCluster, debug
 from tools import known_failure, rows_to_list, since
 
 DEFAULT_FLOAT_PRECISION = 5  # magic number copied from cqlsh script
-DEFAULT_TIME_FORMAT = '%Y-%m-%d %H:%M:%S%z'  # based on cqlsh script
 
 PARTITIONERS = {
     "murmur3": "org.apache.cassandra.dht.Murmur3Partitioner",
@@ -95,6 +92,24 @@ class CqlshCopyTest(Tester):
         self.session.execute('DROP KEYSPACE IF EXISTS ks')
         self.create_ks(self.session, 'ks', 1)
 
+    @property
+    def default_time_format(self):
+        """
+        The default time format as defined in formatting.py if available (versions 2.2+) or
+        a hard-coded value for version 2.1
+        """
+        try:
+            return self._default_time_format
+        except AttributeError:
+            with self._cqlshlib():
+                try:
+                    from cqlshlib.formatting import DEFAULT_TIMESTAMP_FORMAT
+                    self._default_time_format = DEFAULT_TIMESTAMP_FORMAT
+                except ImportError:  # version 2.1
+                    self._default_time_format = '%Y-%m-%d %H:%M:%S%z'
+
+            return self._default_time_format
+
     def all_datatypes_prepare(self):
         self.prepare()
 
@@ -130,12 +145,14 @@ class CqlshCopyTest(Tester):
                 w frozen<set<set<inet>>>,
             )''')
 
+        default_time_format = self.default_time_format
+
         class Datetime(datetime.datetime):
             def __str__(self):
-                return self.strftime(DEFAULT_TIME_FORMAT)
+                return self.strftime(default_time_format)
 
             def __repr__(self):
-                return self.strftime(DEFAULT_TIME_FORMAT)
+                return self.strftime(default_time_format)
 
         def maybe_quote(s):
             """
@@ -232,26 +249,21 @@ class CqlshCopyTest(Tester):
             sys.path = saved_path
 
     def assertCsvResultEqual(self, csv_filename, results):
-        result_list = list(self.result_to_csv_rows(results))
-        processed_results = [[strip_timezone_if_time_string(v) for v in row]
-                             for row in result_list]
-
-        csv_file = list(csv_rows(csv_filename))
-        processed_csv = [[strip_timezone_if_time_string(v) for v in row]
-                         for row in csv_file]
+        processed_results = list(self.result_to_csv_rows(results))
+        csv_results = list(csv_rows(csv_filename))
 
         self.maxDiff = None
         try:
-            self.assertItemsEqual(processed_csv, processed_results)
+            self.assertItemsEqual(csv_results, processed_results)
         except Exception as e:
-            if len(processed_csv) != len(processed_results):
-                warning("Different # of entries. CSV: " + str(len(processed_csv)) +
+            if len(csv_results) != len(processed_results):
+                warning("Different # of entries. CSV: " + str(len(csv_results)) +
                         " vs results: " + str(len(processed_results)))
-            elif(processed_csv[0] != None):
-                for x in range(0, len(processed_csv[0])):
-                    if processed_csv[0][x] != processed_results[0][x]:
+            elif csv_results[0] is not None:
+                for x in range(0, len(csv_results[0])):
+                    if csv_results[0][x] != processed_results[0][x]:
                         warning("Mismatch at index: " + str(x))
-                        warning("Value in csv: " + str(processed_csv[0][x]))
+                        warning("Value in csv: " + str(csv_results[0][x]))
                         warning("Value in result: " + str(processed_results[0][x]))
             raise e
 
@@ -282,7 +294,7 @@ class CqlshCopyTest(Tester):
                             val,
                             encoding=encoding_name,
                             date_time_format=date_time_format,
-                            time_format=DEFAULT_TIME_FORMAT,
+                            time_format=self.default_time_format,
                             float_precision=DEFAULT_FLOAT_PRECISION,
                             colormap=DummyColorMap(),
                             nullval=None).strval
