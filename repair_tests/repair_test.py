@@ -36,6 +36,9 @@ def _repair_options(version, ks='', cf=None, sequential=True):
         opts += [cf]
     return opts
 
+LEGACY_SSTABLES_JVM_ARGS = ["-Dcassandra.streamdes.initial_mem_buffer_size=1",
+                            "-Dcassandra.streamdes.max_mem_buffer_size=5  ",
+                            "-Dcassandra.streamdes.max_spill_file_size=16"]
 
 class TestRepair(Tester):
 
@@ -194,6 +197,24 @@ class TestRepair(Tester):
         """
         self._empty_vs_gcable_no_repair(sequential=False)
 
+    @since('3.0')
+    def repair_after_upgrade_test(self):
+        """
+        @jira_ticket CASSANDRA-10990
+        """
+        default_install_dir = self.cluster.get_install_dir()
+        cluster = self.cluster
+        cluster.set_configuration_options(values={'hinted_handoff_enabled': False}, batch_commitlog=True)
+
+        # Forcing cluster version on purpose
+        debug("Starting cluster..")
+        cluster.set_install_dir(version="2.1.9")
+        cluster.populate(3).start()
+
+        self._populate_cluster(start=False)
+        self._do_upgrade(default_install_dir)
+        self._repair_and_verify(True)
+
     @no_vnodes()
     def simple_repair_order_preserving_test(self):
         """
@@ -201,6 +222,32 @@ class TestRepair(Tester):
         @jira_ticket CASSANDRA-5220
         """
         self._simple_repair(order_preserving_partitioner=True)
+
+    def _populate_cluster(self, start=True):
+        cluster = self.cluster
+
+        if start:
+            # Disable hinted handoff and set batch commit log so this doesn't
+            # interfere with the test (this must be after the populate)
+            cluster.set_configuration_options(values={'hinted_handoff_enabled': False}, batch_commitlog=True)
+            debug("Starting cluster..")
+            cluster.populate(3).start()
+        node1, node2, node3 = cluster.nodelist()
+
+        session = self.patient_cql_connection(node1)
+        self.create_ks(session, 'ks', 3)
+        self.create_cf(session, 'cf', read_repair=0.0, columns={'c1': 'text', 'c2': 'text'})
+
+        # Insert 1000 keys, kill node 3, insert 1 key, restart node 3, insert 1000 more keys
+        debug("Inserting data...")
+        insert_c1c2(session, n=1000, consistency=ConsistencyLevel.ALL)
+        node3.flush()
+        node3.stop(wait_other_notice=True)
+        insert_c1c2(session, keys=(1000, ), consistency=ConsistencyLevel.TWO)
+        node3.start(wait_other_notice=True, wait_for_binary_proto=True)
+        insert_c1c2(session, keys=range(1001, 2001), consistency=ConsistencyLevel.ALL)
+
+        cluster.flush()
 
     def _simple_repair(self, order_preserving_partitioner=False, sequential=True):
         """
@@ -221,32 +268,15 @@ class TestRepair(Tester):
 
         @jira_ticket CASSANDRA-4373
         """
-        cluster = self.cluster
-
         if order_preserving_partitioner:
             cluster.set_partitioner('org.apache.cassandra.dht.ByteOrderedPartitioner')
 
-        # Disable hinted handoff and set batch commit log so this doesn't
-        # interfere with the test (this must be after the populate)
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False}, batch_commitlog=True)
-        debug("Starting cluster..")
-        cluster.populate(3).start()
+        self._populate_cluster()
+        self._repair_and_verify(sequential)
+
+    def _repair_and_verify(self, sequential=True):
+        cluster = self.cluster
         node1, node2, node3 = cluster.nodelist()
-
-        session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 3)
-        self.create_cf(session, 'cf', read_repair=0.0, columns={'c1': 'text', 'c2': 'text'})
-
-        # Insert 1000 keys, kill node 3, insert 1 key, restart node 3, insert 1000 more keys
-        debug("Inserting data...")
-        insert_c1c2(session, n=1000, consistency=ConsistencyLevel.ALL)
-        node3.flush()
-        node3.stop(wait_other_notice=True)
-        insert_c1c2(session, keys=(1000, ), consistency=ConsistencyLevel.TWO)
-        node3.start(wait_other_notice=True, wait_for_binary_proto=True)
-        insert_c1c2(session, keys=range(1001, 2001), consistency=ConsistencyLevel.ALL)
-
-        cluster.flush()
 
         # Verify that node3 has only 2000 keys
         debug("Checking data on node3...")
@@ -707,6 +737,19 @@ class TestRepair(Tester):
                           rows[0][0],
                           'Expected {} job threads in repair options. Instead we saw {}'.format(job_thread_count, rows[0][0]))
 
+    def _do_upgrade(self, default_install_dir):
+        cluster = self.cluster
+
+        for node in cluster.nodelist():
+            debug("Upgrading %s" % node.name)
+            if node.is_running():
+                node.flush()
+                time.sleep(1)
+                node.stop(wait_other_notice=True)
+            node.set_install_dir(install_dir=default_install_dir)
+            node.start(wait_other_notice=True, wait_for_binary_proto=True)
+            cursor = self.patient_cql_connection(node)
+        cluster.set_install_dir(default_install_dir)
 
 RepairTableContents = namedtuple('RepairTableContents',
                                  ['parent_repair_history', 'repair_history'])
