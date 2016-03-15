@@ -4,12 +4,16 @@ from assertions import assert_all, assert_none, assert_one
 from dtest import Tester
 from tools import since, new_node
 
+LEGACY_SSTABLES_JVM_ARGS=["-Dcassandra.dtest.rdisp_initial_buffer_size=1",
+                          "-Dcassandra.dtest.rdisp_max_buffer_size=3"]
+
 @since('3.0')
 class TestStorageEngineUpgrade(Tester):
-    def setUp(self, bootstrap=False):
+    def setUp(self, bootstrap=False, jvm_args=[]):
         super(TestStorageEngineUpgrade, self).setUp()
         self.default_install_dir = self.cluster.get_install_dir()
         self.bootstrap = bootstrap
+        self.jvm_args = jvm_args
 
     def _setup_cluster(self, create_keyspace=True):
         cluster = self.cluster
@@ -41,7 +45,12 @@ class TestStorageEngineUpgrade(Tester):
             cluster.set_install_dir(install_dir=self.default_install_dir)
             # Add a new node, bootstrap=True ensures that it is not a seed
             node2 = new_node(cluster, bootstrap=True)
-            node2.start(wait_for_binary_proto=True)
+            node2.start(wait_for_binary_proto=True, jvm_args=self.jvm_args)
+
+            # check that RewindableDataInputStreamPlus spill files are properly cleaned up
+            temp_files = self.glob_data_dirs(os.path.join(keyspace_dir, '*', "tmp", "*.dat"))
+            debug("temp files: " + str(temp_files))
+            self.assertEquals(0, len(temp_files), "Temporary files were not cleaned up.")
 
         cursor = self.patient_cql_connection(node1)
         if login_keyspace:
@@ -325,4 +334,4 @@ class TestStorageEngineUpgrade(Tester):
 @since('3.0')
 class TestBootstrapAfterUpgrade(TestStorageEngineUpgrade):
     def setUp(self):
-        super(TestBootstrapAfterUpgrade, self).setUp(bootstrap=True)
+        super(TestBootstrapAfterUpgrade, self).setUp(bootstrap=True, jvm_args=LEGACY_SSTABLES_JVM_ARGS)
