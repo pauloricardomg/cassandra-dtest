@@ -7,8 +7,10 @@ from dtest import Tester, debug
 from ccmlib import common as ccmcommon
 from tools import since
 
-LEGACY_SSTABLES_JVM_ARGS=["-Dcassandra.dtest.rdisp_initial_buffer_size=1",
-                          "-Dcassandra.dtest.rdisp_max_buffer_size=3"]
+LEGACY_SSTABLES_JVM_ARGS = ["-Dcassandra.streamdes.initial_mem_buffer_size=1",
+                            "-Dcassandra.streamdes.max_mem_buffer_size=5  ",
+                            "-Dcassandra.streamdes.max_spill_file_size=64"]
+
 
 class BaseSStableLoaderTest():
 
@@ -168,9 +170,14 @@ class BaseSStableLoaderTest():
 
         # check that RewindableDataInputStreamPlus spill files are properly cleaned up
         if self.upgrade_from:
-            temp_files = self.glob_data_dirs(os.path.join(keyspace_dir, '*', "tmp", "*.dat"))
-            debug("temp files: " + str(temp_files))
-            self.assertEquals(0, len(temp_files), "Temporary files were not cleaned up.")
+            for x in xrange(0, cluster.data_dir_count):
+                data_dir = os.path.join(node1.get_path(), 'data{0}'.format(x))
+                for ddir in os.listdir(data_dir):
+                    keyspace_dir = os.path.join(data_dir, ddir)
+                    temp_files = self.glob_data_dirs(os.path.join(keyspace_dir, '*', "tmp", "*.dat"))
+                    debug("temp files: " + str(temp_files))
+                    self.assertEquals(0, len(temp_files), "Temporary files were not cleaned up.")
+
 
 @since('3.0')
 class TestLoadKaSStables(Tester, BaseSStableLoaderTest):
@@ -179,6 +186,7 @@ class TestLoadKaSStables(Tester, BaseSStableLoaderTest):
         kwargs['cluster_options'] = {'start_rpc': 'true'}
         Tester.__init__(self, *argv, **kwargs)
         BaseSStableLoaderTest.__init__(self, upgrade_from='2.1.6', jvm_args=LEGACY_SSTABLES_JVM_ARGS)
+
 
 @since('3.0')
 class TestLoadKaCompactSStables(Tester, BaseSStableLoaderTest):
@@ -189,6 +197,7 @@ class TestLoadKaCompactSStables(Tester, BaseSStableLoaderTest):
         BaseSStableLoaderTest.__init__(self, upgrade_from='2.1.6', compact=True,
                                        jvm_args=LEGACY_SSTABLES_JVM_ARGS)
 
+
 @since('3.0')
 class TestLoadLaSStables(Tester, BaseSStableLoaderTest):
 
@@ -196,6 +205,7 @@ class TestLoadLaSStables(Tester, BaseSStableLoaderTest):
         kwargs['cluster_options'] = {'start_rpc': 'true'}
         Tester.__init__(self, *argv, **kwargs)
         BaseSStableLoaderTest.__init__(self, upgrade_from='2.2.4', jvm_args=LEGACY_SSTABLES_JVM_ARGS)
+
 
 @since('3.0')
 class TestLoadLaCompactSStables(Tester, BaseSStableLoaderTest):
@@ -205,6 +215,7 @@ class TestLoadLaCompactSStables(Tester, BaseSStableLoaderTest):
         Tester.__init__(self, *argv, **kwargs)
         BaseSStableLoaderTest.__init__(self, upgrade_from='2.2.4', compact=True,
                                        jvm_args=LEGACY_SSTABLES_JVM_ARGS)
+
 
 class TestSSTableGenerationAndLoading(Tester, BaseSStableLoaderTest):
 
