@@ -1,11 +1,15 @@
 import time
+import os
 
 from assertions import assert_all, assert_none, assert_one
-from dtest import Tester
+from dtest import Tester, debug
 from tools import since, new_node
 
-LEGACY_SSTABLES_JVM_ARGS=["-Dcassandra.dtest.rdisp_initial_buffer_size=1",
-                          "-Dcassandra.dtest.rdisp_max_buffer_size=3"]
+
+LEGACY_SSTABLES_JVM_ARGS = ["-Dcassandra.streamdes.initial_mem_buffer_size=1",
+                            "-Dcassandra.streamdes.max_mem_buffer_size=5  ",
+                            "-Dcassandra.streamdes.max_spill_file_size=128"]
+
 
 @since('3.0')
 class TestStorageEngineUpgrade(Tester):
@@ -47,10 +51,13 @@ class TestStorageEngineUpgrade(Tester):
             node2 = new_node(cluster, bootstrap=True)
             node2.start(wait_for_binary_proto=True, jvm_args=self.jvm_args)
 
-            # check that RewindableDataInputStreamPlus spill files are properly cleaned up
-            temp_files = self.glob_data_dirs(os.path.join(keyspace_dir, '*', "tmp", "*.dat"))
-            debug("temp files: " + str(temp_files))
-            self.assertEquals(0, len(temp_files), "Temporary files were not cleaned up.")
+            for x in xrange(0, cluster.data_dir_count):
+                data_dir = os.path.join(node2.get_path(), 'data{0}'.format(x))
+                for ddir in os.listdir(data_dir):
+                    keyspace_dir = os.path.join(data_dir, ddir)
+                    temp_files = self.glob_data_dirs(os.path.join(keyspace_dir, '*', "tmp", "*.dat"))
+                    debug("temp files: " + str(temp_files))
+                    self.assertEquals(0, len(temp_files), "Temporary files were not cleaned up.")
 
         cursor = self.patient_cql_connection(node1)
         if login_keyspace:
@@ -330,6 +337,7 @@ class TestStorageEngineUpgrade(Tester):
         self.cluster.compact()
 
         assert_one(session, "SELECT k FROM t", ['some_key'])
+
 
 @since('3.0')
 class TestBootstrapAfterUpgrade(TestStorageEngineUpgrade):
