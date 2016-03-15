@@ -17,6 +17,7 @@ import threading
 import time
 import traceback
 import types
+import glob
 from collections import OrderedDict
 from unittest import TestCase
 
@@ -421,6 +422,14 @@ class Tester(TestCase):
         print_("Error details: \n{message}".format(message=message))
         self.exit_with_exception = AssertionError("Log error encountered during active log scanning, see stdout")
         thread.interrupt_main()
+
+    def glob_data_dirs(self, path, ks="ks"):
+        result = []
+        for node in self.cluster.nodelist():
+            for data_dir in node.data_directories():
+                keyspace_dir = os.path.join(data_dir, ks)
+                result.extend(glob.glob(path))
+        return result
 
     def _catch_interrupt(self, signal, frame):
         """

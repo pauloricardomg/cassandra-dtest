@@ -5,14 +5,213 @@ import time
 
 from dtest import Tester, debug
 from ccmlib import common as ccmcommon
+from tools import since
 
+LEGACY_SSTABLES_JVM_ARGS=["-Dcassandra.dtest.rdisp_initial_buffer_size=1",
+                          "-Dcassandra.dtest.rdisp_max_buffer_size=3"]
 
-class TestSSTableGenerationAndLoading(Tester):
+class BaseSStableLoaderTest():
+
+    def __init__(self, upgrade_from=None, compact=False, cluster_options=None, jvm_args=[]):
+        self.upgrade_from = upgrade_from
+        self.compact = compact
+        self.allow_log_errors = True
+        self.jvm_args = jvm_args
+
+    def sstableloader_compression_none_to_none_test(self):
+        self.load_sstable_with_configuration(None, None)
+
+    def sstableloader_compression_none_to_snappy_test(self):
+        self.load_sstable_with_configuration(None, 'Snappy')
+
+    def sstableloader_compression_none_to_deflate_test(self):
+        self.load_sstable_with_configuration(None, 'Deflate')
+
+    def sstableloader_compression_snappy_to_none_test(self):
+        self.load_sstable_with_configuration('Snappy', None)
+
+    def sstableloader_compression_snappy_to_snappy_test(self):
+        self.load_sstable_with_configuration('Snappy', 'Snappy')
+
+    def sstableloader_compression_snappy_to_deflate_test(self):
+        self.load_sstable_with_configuration('Snappy', 'Deflate')
+
+    def sstableloader_compression_deflate_to_none_test(self):
+        self.load_sstable_with_configuration('Deflate', None)
+
+    def sstableloader_compression_deflate_to_snappy_test(self):
+        self.load_sstable_with_configuration('Deflate', 'Snappy')
+
+    def sstableloader_compression_deflate_to_deflate_test(self):
+        self.load_sstable_with_configuration('Deflate', 'Deflate')
+
+    def sstableloader_uppercase_keyspace_name_test(self):
+        """
+        Make sure sstableloader works with upper case keyspace
+        @jira_ticket CASSANDRA-10806
+        """
+        self.load_sstable_with_configuration(ks='"Keyspace1"')
+
+    def load_sstable_with_configuration(self, pre_compression=None,
+                                        post_compression=None,
+                                        ks="ks"):
+        """
+        tests that the sstableloader works by using it to load data.
+        Compression of the columnfamilies being loaded, and loaded into
+        can be specified.
+
+        pre_compression and post_compression can be these values:
+        None, 'Snappy', or 'Deflate'.
+        """
+        NUM_KEYS = 1000
+
+        for compression_option in (pre_compression, post_compression):
+            assert compression_option in (None, 'Snappy', 'Deflate')
+
+        debug("Testing sstableloader with pre_compression=%s and post_compression=%s" % (pre_compression, post_compression))
+
+        cluster = self.cluster
+        if self.upgrade_from:
+            debug("Generating sstables with version %s" % (self.upgrade_from))
+            default_install_dir = self.cluster.get_install_dir()
+            # Forcing cluster version on purpose
+            cluster.set_install_dir(version=self.upgrade_from)
+        debug("Using jvm_args=%s" % self.jvm_args)
+        cluster.populate(2).start(jvm_args=self.jvm_args)
+        node1, node2 = cluster.nodelist()
+        time.sleep(.5)
+
+        def create_schema(session, compression):
+            self.create_ks(session, ks, rf=2)
+            self.create_cf(session, "standard1", compression=compression, compact_storage=self.compact)
+            self.create_cf(session, "counter1", compression=compression, columns={'v': 'counter'},
+                           compact_storage=self.compact)
+
+        debug("creating keyspace and inserting")
+        session = self.cql_connection(node1)
+        create_schema(session, pre_compression)
+
+        for i in range(NUM_KEYS):
+            session.execute("UPDATE standard1 SET v='%d' WHERE KEY='%d' AND c='col'" % (i, i))
+            session.execute("UPDATE counter1 SET v=v+1 WHERE KEY='%d'" % i)
+
+        node1.nodetool('drain')
+        node1.stop()
+        node2.nodetool('drain')
+        node2.stop()
+
+        debug("Making a copy of the sstables")
+        # make a copy of the sstables
+        for x in xrange(0, cluster.data_dir_count):
+            data_dir = os.path.join(node1.get_path(), 'data{0}'.format(x))
+            copy_root = os.path.join(node1.get_path(), 'data{0}_copy'.format(x))
+            for ddir in os.listdir(data_dir):
+                keyspace_dir = os.path.join(data_dir, ddir)
+                if os.path.isdir(keyspace_dir) and ddir != 'system':
+                    copy_dir = os.path.join(copy_root, ddir)
+                    dir_util.copy_tree(keyspace_dir, copy_dir)
+
+        debug("Wiping out the data and restarting cluster")
+        # wipe out the node data.
+        cluster.clear()
+
+        if self.upgrade_from:
+            debug("Running sstableloader with version from %s" % (default_install_dir))
+            # Return to previous version
+            cluster.set_install_dir(install_dir=default_install_dir)
+
+        cluster.start(jvm_args=self.jvm_args)
+        time.sleep(5)  # let gossip figure out what is going on
+
+        debug("re-creating the keyspace and column families.")
+        session = self.cql_connection(node1)
+        create_schema(session, post_compression)
+        time.sleep(2)
+
+        debug("Calling sstableloader")
+        # call sstableloader to re-load each cf.
+        cdir = node1.get_install_dir()
+        sstableloader = os.path.join(cdir, 'bin', ccmcommon.platform_binary('sstableloader'))
+        env = ccmcommon.make_cassandra_env(cdir, node1.get_path())
+        host = node1.address()
+        for x in xrange(0, cluster.data_dir_count):
+            sstablecopy_dir = os.path.join(node1.get_path(), 'data{0}_copy'.format(x), ks.strip('"'))
+            for cf_dir in os.listdir(sstablecopy_dir):
+                full_cf_dir = os.path.join(sstablecopy_dir, cf_dir)
+                if os.path.isdir(full_cf_dir):
+                    cmd_args = [sstableloader, '--nodes', host, full_cf_dir]
+                    p = subprocess.Popen(cmd_args, env=env)
+                    exit_status = p.wait()
+                    self.assertEqual(0, exit_status,
+                                     "sstableloader exited with a non-zero status: %d" % exit_status)
+
+        def read_and_validate_data(session):
+            for i in range(NUM_KEYS):
+                rows = list(session.execute("SELECT * FROM standard1 WHERE KEY='%d'" % i))
+                self.assertEquals([str(i), 'col', str(i)], list(rows[0]))
+                rows = list(session.execute("SELECT * FROM counter1 WHERE KEY='%d'" % i))
+                self.assertEquals([str(i), 1], list(rows[0]))
+
+        debug("Reading data back")
+        # Now we should have sstables with the loaded data, and the existing
+        # data. Lets read it all to make sure it is all there.
+        read_and_validate_data(session)
+
+        debug("scrubbing, compacting, and repairing")
+        # do some operations and try reading the data again.
+        node1.nodetool('scrub')
+        node1.nodetool('compact')
+        node1.nodetool('repair')
+
+        debug("Reading data back one more time")
+        read_and_validate_data(session)
+
+        # check that RewindableDataInputStreamPlus spill files are properly cleaned up
+        if self.upgrade_from:
+            temp_files = self.glob_data_dirs(os.path.join(keyspace_dir, '*', "tmp", "*.dat"))
+            debug("temp files: " + str(temp_files))
+            self.assertEquals(0, len(temp_files), "Temporary files were not cleaned up.")
+
+@since('3.0')
+class TestLoadKaSStables(Tester, BaseSStableLoaderTest):
 
     def __init__(self, *argv, **kwargs):
         kwargs['cluster_options'] = {'start_rpc': 'true'}
-        super(TestSSTableGenerationAndLoading, self).__init__(*argv, **kwargs)
-        self.allow_log_errors = True
+        Tester.__init__(self, *argv, **kwargs)
+        BaseSStableLoaderTest.__init__(self, upgrade_from='2.1.6', jvm_args=LEGACY_SSTABLES_JVM_ARGS)
+
+@since('3.0')
+class TestLoadKaCompactSStables(Tester, BaseSStableLoaderTest):
+
+    def __init__(self, *argv, **kwargs):
+        kwargs['cluster_options'] = {'start_rpc': 'true'}
+        Tester.__init__(self, *argv, **kwargs)
+        BaseSStableLoaderTest.__init__(self, upgrade_from='2.1.6', compact=True,
+                                       jvm_args=LEGACY_SSTABLES_JVM_ARGS)
+
+@since('3.0')
+class TestLoadLaSStables(Tester, BaseSStableLoaderTest):
+
+    def __init__(self, *argv, **kwargs):
+        kwargs['cluster_options'] = {'start_rpc': 'true'}
+        Tester.__init__(self, *argv, **kwargs)
+        BaseSStableLoaderTest.__init__(self, upgrade_from='2.2.4', jvm_args=LEGACY_SSTABLES_JVM_ARGS)
+
+@since('3.0')
+class TestLoadLaCompactSStables(Tester, BaseSStableLoaderTest):
+
+    def __init__(self, *argv, **kwargs):
+        kwargs['cluster_options'] = {'start_rpc': 'true'}
+        Tester.__init__(self, *argv, **kwargs)
+        BaseSStableLoaderTest.__init__(self, upgrade_from='2.2.4', compact=True,
+                                       jvm_args=LEGACY_SSTABLES_JVM_ARGS)
+
+class TestSSTableGenerationAndLoading(Tester, BaseSStableLoaderTest):
+
+    def __init__(self, *argv, **kwargs):
+        kwargs['cluster_options'] = {'start_rpc': 'true'}
+        Tester.__init__(self, *argv, **kwargs)
+        BaseSStableLoaderTest.__init__(self)
 
     def incompressible_data_in_compressed_table_test(self):
         """
@@ -89,136 +288,3 @@ class TestSSTableGenerationAndLoading(Tester):
                 if fname.endswith('Data.db'):
                     data_found += 1
         self.assertGreater(data_found, 0, "After removing index, filter, stats, and digest files, the data file was deleted!")
-
-    def sstableloader_compression_none_to_none_test(self):
-        self.load_sstable_with_configuration(None, None)
-
-    def sstableloader_compression_none_to_snappy_test(self):
-        self.load_sstable_with_configuration(None, 'Snappy')
-
-    def sstableloader_compression_none_to_deflate_test(self):
-        self.load_sstable_with_configuration(None, 'Deflate')
-
-    def sstableloader_compression_snappy_to_none_test(self):
-        self.load_sstable_with_configuration('Snappy', None)
-
-    def sstableloader_compression_snappy_to_snappy_test(self):
-        self.load_sstable_with_configuration('Snappy', 'Snappy')
-
-    def sstableloader_compression_snappy_to_deflate_test(self):
-        self.load_sstable_with_configuration('Snappy', 'Deflate')
-
-    def sstableloader_compression_deflate_to_none_test(self):
-        self.load_sstable_with_configuration('Deflate', None)
-
-    def sstableloader_compression_deflate_to_snappy_test(self):
-        self.load_sstable_with_configuration('Deflate', 'Snappy')
-
-    def sstableloader_compression_deflate_to_deflate_test(self):
-        self.load_sstable_with_configuration('Deflate', 'Deflate')
-
-    def sstableloader_uppercase_keyspace_name_test(self):
-        """
-        Make sure sstableloader works with upper case keyspace
-        @jira_ticket CASSANDRA-10806
-        """
-        self.load_sstable_with_configuration(ks='"Keyspace1"')
-
-    def load_sstable_with_configuration(self, pre_compression=None, post_compression=None, ks="ks"):
-        """
-        tests that the sstableloader works by using it to load data.
-        Compression of the columnfamilies being loaded, and loaded into
-        can be specified.
-
-        pre_compression and post_compression can be these values:
-        None, 'Snappy', or 'Deflate'.
-        """
-        NUM_KEYS = 1000
-
-        for compression_option in (pre_compression, post_compression):
-            assert compression_option in (None, 'Snappy', 'Deflate')
-
-        debug("Testing sstableloader with pre_compression=%s and post_compression=%s" % (pre_compression, post_compression))
-
-        cluster = self.cluster
-        cluster.populate(2).start()
-        node1, node2 = cluster.nodelist()
-        time.sleep(.5)
-
-        def create_schema(session, compression):
-            self.create_ks(session, ks, rf=2)
-            self.create_cf(session, "standard1", compression=compression)
-            self.create_cf(session, "counter1", compression=compression, columns={'v': 'counter'})
-
-        debug("creating keyspace and inserting")
-        session = self.cql_connection(node1)
-        create_schema(session, pre_compression)
-
-        for i in range(NUM_KEYS):
-            session.execute("UPDATE standard1 SET v='%d' WHERE KEY='%d' AND c='col'" % (i, i))
-            session.execute("UPDATE counter1 SET v=v+1 WHERE KEY='%d'" % i)
-
-        node1.nodetool('drain')
-        node1.stop()
-        node2.nodetool('drain')
-        node2.stop()
-
-        debug("Making a copy of the sstables")
-        # make a copy of the sstables
-        for x in xrange(0, cluster.data_dir_count):
-            data_dir = os.path.join(node1.get_path(), 'data{0}'.format(x))
-            copy_root = os.path.join(node1.get_path(), 'data{0}_copy'.format(x))
-            for ddir in os.listdir(data_dir):
-                keyspace_dir = os.path.join(data_dir, ddir)
-                if os.path.isdir(keyspace_dir) and ddir != 'system':
-                    copy_dir = os.path.join(copy_root, ddir)
-                    dir_util.copy_tree(keyspace_dir, copy_dir)
-
-        debug("Wiping out the data and restarting cluster")
-        # wipe out the node data.
-        cluster.clear()
-        cluster.start()
-        time.sleep(5)  # let gossip figure out what is going on
-
-        debug("re-creating the keyspace and column families.")
-        session = self.cql_connection(node1)
-        create_schema(session, post_compression)
-        time.sleep(2)
-
-        debug("Calling sstableloader")
-        # call sstableloader to re-load each cf.
-        cdir = node1.get_install_dir()
-        sstableloader = os.path.join(cdir, 'bin', ccmcommon.platform_binary('sstableloader'))
-        env = ccmcommon.make_cassandra_env(cdir, node1.get_path())
-        host = node1.address()
-        for x in xrange(0, cluster.data_dir_count):
-            sstablecopy_dir = os.path.join(node1.get_path(), 'data{0}_copy'.format(x), ks.strip('"'))
-            for cf_dir in os.listdir(sstablecopy_dir):
-                full_cf_dir = os.path.join(sstablecopy_dir, cf_dir)
-                if os.path.isdir(full_cf_dir):
-                    cmd_args = [sstableloader, '--nodes', host, full_cf_dir]
-                    p = subprocess.Popen(cmd_args, env=env)
-                    exit_status = p.wait()
-                    self.assertEqual(0, exit_status,
-                                     "sstableloader exited with a non-zero status: %d" % exit_status)
-
-        def read_and_validate_data(session):
-            for i in range(NUM_KEYS):
-                rows = list(session.execute("SELECT * FROM standard1 WHERE KEY='%d'" % i))
-                self.assertEquals([str(i), 'col', str(i)], list(rows[0]))
-                rows = list(session.execute("SELECT * FROM counter1 WHERE KEY='%d'" % i))
-                self.assertEquals([str(i), 1], list(rows[0]))
-
-        debug("Reading data back")
-        # Now we should have sstables with the loaded data, and the existing
-        # data. Lets read it all to make sure it is all there.
-        read_and_validate_data(session)
-
-        debug("scrubbing, compacting, and repairing")
-        # do some operations and try reading the data again.
-        node1.nodetool('scrub')
-        node1.nodetool('compact')
-        node1.nodetool('repair')
-
-        debug("Reading data back one more time")
-        read_and_validate_data(session)
