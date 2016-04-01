@@ -8,6 +8,7 @@ from cassandra.query import SimpleStatement
 
 from dtest import Tester, debug
 from tools import insert_c1c2, known_failure, no_vnodes, query_c1c2, since
+from ccmlib.node import TimeoutError
 
 
 def _repair_options(version, ks='', cf=None, sequential=True):
@@ -282,6 +283,108 @@ class TestRepair(Tester):
 
         # Check node3 now has the key
         self.check_rows_on_node(node3, 2001, found=[1000], restart=False)
+
+    def fail_sync_on_one_participant_test(self):
+        self._check_repair_does_not_finish_early('sync')
+
+    def fail_validation_on_one_participant_test(self):
+        self._check_repair_does_not_finish_early('validation')
+
+    def kill_participant_during_validation_test(self):
+        self._check_repair_does_not_finish_early('validation', True)
+
+    def kill_participant_during_sync_test(self):
+        self._check_repair_does_not_finish_early('sync', True)
+
+    def _check_repair_does_not_finish_early(self, phase, kill_node3=False):
+        """
+        * Configure a three node cluster to not use hinted handoff, and to use batch commitlog
+        * Launch the cluster
+        * Create a keyspace at RF 3 and table
+        * Insert exclusive data on node1 and node4
+        * Configure node2 to hang all requests for validation or sync
+        * Configure node3 to faill all requests for validation or sync
+        * Run repair on node1
+        * Check repair never finishes (since node2 did not reply)
+        """
+        cluster = self.cluster
+        self.ignore_log_patterns = ['Validation failed', 'AntiEntropySessions', 'RepairJobTask', 'Stream', 'RepairRunnable',
+                                    'RepairSession']
+        cluster.set_configuration_options(values={'streaming_socket_timeout_in_ms': 5000})
+
+        # Disable hinted handoff and set batch commit log so this doesn't
+        # interfere with the test (this must be after the populate)
+        cluster.set_configuration_options(values={'hinted_handoff_enabled': False}, batch_commitlog=True)
+        debug("Starting cluster..")
+        cluster.populate(3).start()
+        node1, node2, node3= cluster.nodelist()
+
+        debug("Creating schema..")
+        session = self.patient_cql_connection(node1)
+        self.create_ks(session, 'ks', 3)
+        self.create_cf(session, 'cf', read_repair=0.0, columns={'c1': 'text', 'c2': 'text'})
+
+        debug("Stopping nodes 2 and 3...")
+        node2.stop(wait_other_notice=True)
+        node3.stop(wait_other_notice=True)
+
+        debug("Inserting exclusive data on node1")
+        insert_c1c2(session, n=1000, consistency=ConsistencyLevel.ONE)
+        cluster.flush()
+
+        debug("Starting nodes 2 and 3...")
+
+        if phase == 'validation':
+            node2.start(wait_other_notice=True, wait_for_binary_proto=True, jvm_args=['-Dcassandra.test.repair.drop_validation=true'])
+            if kill_node3:
+                node3.start(wait_other_notice=True, wait_for_binary_proto=True, jvm_args=['-Dcassandra.test.repair.drop_validation=true'])
+            else:
+                node3.start(wait_other_notice=True, wait_for_binary_proto=True, jvm_args=['-Dcassandra.test.repair.fail_validation=true'])
+        elif phase == 'sync':
+            node2.start(wait_other_notice=True, wait_for_binary_proto=True, jvm_args=['-Dcassandra.test.stream.freeze_address=127.0.0.2'])
+            if kill_node3:
+                node3.start(wait_other_notice=True, wait_for_binary_proto=True, jvm_args=['-Dcassandra.test.stream.freeze_address=127.0.0.3'])
+            else:
+                node3.start(wait_other_notice=True, wait_for_binary_proto=True, jvm_args=['-Dcassandra.test.stream.fail_address=127.0.0.3'])
+
+        # Run repair
+        debug("Starting repair on node1")
+        node1.repair(_repair_options(self.cluster.version(), ks='ks', sequential=False),
+                     capture_output=False, wait=False)
+
+        if kill_node3:
+            if cluster.version() >= '2.2':
+                node3.watch_log_for('Received prepare message', timeout=10, filename='debug.log')
+            else:
+                # 2.1 doesn't have debug.log, so we are logging at trace, and look
+                # in the system.log file
+                node3.watch_log_for('Received prepare message', timeout=10, filename='system.log')
+            debug("Killing node3")
+            node3.stop()
+
+        # We wait 30 seconds for the "Repair completed" message.
+        # It should not be found because the repair should never
+        # complete
+        debug("Checking repair did not finish")
+        try:
+            node1.watch_log_for('Repair command #1 finished', timeout=30)
+            self.fail("Should not complete repair.")
+        except TimeoutError:
+            pass
+
+        # Just to make sure nodes are really failing or freezing requests :)
+        if phase == 'validation':
+            self.assertTrue(node2.grep_log('Dropping validation request due to cassandra.test.repair.drop_validation property.'))
+            if kill_node3:
+                self.assertTrue(node3.grep_log('Dropping validation request due to cassandra.test.repair.drop_validation property.'))
+            else:
+                self.assertTrue(node3.grep_log('Failing validation request due to cassandra.test.repair.fail_type property.'))
+        elif phase == 'sync':
+            self.assertTrue(node2.grep_log('Freezing stream task'))
+            if kill_node3:
+                self.assertTrue(node3.grep_log('Freezing stream task'))
+            else:
+                self.assertTrue(node3.grep_log('Failing stream task'))
 
     def _empty_vs_gcable_no_repair(self, sequential):
         """
