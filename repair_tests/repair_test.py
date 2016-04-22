@@ -5,12 +5,33 @@ from unittest import skip
 
 from cassandra import ConsistencyLevel
 from cassandra.query import SimpleStatement
+from threading import Thread
 
 from dtest import Tester, debug
 from tools import insert_c1c2, known_failure, no_vnodes, query_c1c2, since
+from ccmlib.node import TimeoutError
 
+START_VALIDATION_MSG = "Validating ValidationRequest"
+ABORTED_VALIDATION_MSG = "Ignoring failure of validation task"
 
-def _repair_options(version, ks='', cf=None, sequential=True):
+START_SYNC_MSG = "Performing streaming repair of .* ranges with"
+ABORTED_SYNC_MSG = "Ignoring failure of sync task"
+
+START_ANTICOMPACTION_MSG = "Starting anticompaction of"
+ABORTED_ANTICOMPACTION_MSG = "Ignoring failure of anticompaction task from aborted or unknown parent repair session"
+
+class AbortRepair(Thread):
+
+    def __init__(self, node, message_to_watch):
+        Thread.__init__(self)
+        self.node = node
+        self.message_to_watch = message_to_watch
+
+    def run(self):
+        self.node.watch_log_for(self.message_to_watch, filename='debug.log')
+        self.node.nodetool('repair --abort-all')
+
+def _repair_options(version, ks='', cf=None, sequential=True, pr=False):
     """
     Function for assembling appropriate repair CLI options,
     based on C* version, as defaults have changed.
@@ -28,6 +49,9 @@ def _repair_options(version, ks='', cf=None, sequential=True):
         if version < '2.2':
             opts += ['-par']
 
+    if pr:
+        opts += ['-pr']
+
     # test with full repair
     if version >= '2.2':
         opts += ['-full']
@@ -39,6 +63,10 @@ def _repair_options(version, ks='', cf=None, sequential=True):
 
 
 class TestRepair(Tester):
+
+    def setUp(self):
+        super(TestRepair, self).setUp()
+        self.ignore_log_patterns = []
 
     def check_rows_on_node(self, node_to_check, rows, found=None, missings=None, restart=True):
         """
@@ -104,6 +132,95 @@ class TestRepair(Tester):
         # and no nodes should do anticompaction:
         for node in cluster.nodelist():
             self.assertFalse(node.grep_log("Starting anticompaction"))
+
+
+    def abort_coordinator_during_validation_test(self):
+        self._abort_all_repairs_test(START_VALIDATION_MSG, ABORTED_VALIDATION_MSG, coordinator=True)
+
+    def abort_participant_during_validation_test(self):
+        self._abort_all_repairs_test(START_VALIDATION_MSG, ABORTED_VALIDATION_MSG)
+
+    def abort_coordinator_during_sync_test(self):
+        self.ignore_log_patterns = ["Streaming error occurred on session with peer", "failed stream session"]
+        self._abort_all_repairs_test(START_SYNC_MSG, ABORTED_SYNC_MSG, coordinator=True)
+
+    def abort_participant_during_sync_test(self):
+        self.ignore_log_patterns = ["Streaming error occurred on session with peer", "failed stream session"]
+        self._abort_all_repairs_test(START_SYNC_MSG, ABORTED_SYNC_MSG)
+
+    def abort_coordinator_during_anticompaction_test(self):
+        self._abort_all_repairs_test(START_ANTICOMPACTION_MSG, ABORTED_ANTICOMPACTION_MSG, coordinator=True, anticompaction=True)
+
+    def abort_participant_during_anticompaction_test(self):
+        self._abort_all_repairs_test(START_ANTICOMPACTION_MSG, ABORTED_ANTICOMPACTION_MSG, anticompaction=True)
+
+    def _abort_all_repairs_test(self, message_before_abort, task_aborted_message, coordinator=False, anticompaction=False):
+        """
+        * Abort repair and check that all tasks were aborted successfully
+        @jira_ticket CASSANDRA-3486
+        """
+        cluster = self.cluster
+        # Disable hinted handoff and set batch commit log so this doesn't interfere with the test
+        # Also decrease stream throughput so sync can be aborted before stream finishes
+        cluster.set_configuration_options(values={'hinted_handoff_enabled': False,
+                                                  'stream_throughput_outbound_megabits_per_sec': 1},
+                                          batch_commitlog=True)
+
+        debug("Starting cluster..")
+        cluster.populate(3).start(wait_for_binary_proto=True)
+        node1, node2, node3 = cluster.nodelist()
+
+        debug("Run stress with n=1 to create schema..")
+        node1.stress(stress_options=['write', 'n=1', 'cl=TWO', '-rate', 'threads=300', '-schema', 'replication(factor=3)',
+         'compaction(strategy=org.apache.cassandra.db.compaction.LeveledCompactionStrategy,sstable_size_in_mb=1)'],
+          whitelist=True)
+
+        debug("Stop node3..")
+        node3.stop(wait_other_notice=True)
+
+        debug("Run stress with n=100K, CL=TWO on node1 and node2")
+        node1.stress(stress_options=['write', 'n=100K', 'cl=TWO', '-rate', 'threads=300', '-schema', 'replication(factor=3)',
+                 'compaction(strategy=org.apache.cassandra.db.compaction.LeveledCompactionStrategy,sstable_size_in_mb=1)'],
+                  whitelist=True)
+        cluster.flush()
+
+        debug("Waiting for compactions to finish..")
+        try:
+            cluster.wait_for_compactions(timeout=10)
+        except TimeoutError, e:
+            debug("Timed out waiting for compaction. Nevermind.")
+
+        debug("Start node3..")
+        node3.start(wait_other_notice=True)
+
+        node_to_abort = node1 if coordinator else node2
+
+        # abort repair when message appears
+        t = AbortRepair(node_to_abort, message_before_abort)
+        t.start()
+
+        debug("Reducing compaction throughput so validation does not finish before being aborted")
+        cluster.nodetool("setcompactionthroughput 1")
+
+        debug("Starting repair on node 1")
+        node1.repair(_repair_options(self.cluster.version(), ks='keyspace1', cf='standard1',
+                     sequential=False, pr=anticompaction))
+
+        t.join()
+
+        debug("Checking repair job was aborted in all participants")
+        for node in cluster.nodelist():
+            aborted = node.grep_log("Aborting parent repair session")
+            # some nodes might complete anti-compaction before aborting, which is fine
+            finished = node.grep_log("Completed anticompaction successfully") if anticompaction else False
+            self.assertTrue(aborted or finished)
+
+        debug("Checking parent repair session failed on node1")
+        node1.watch_log_for("Parent repair session .* was aborted.", timeout=10)
+
+        debug("Checking repair task was aborted on node that triggered abortion")
+        node_to_abort.watch_log_for(task_aborted_message, timeout=20, filename='debug.log')
+
 
     @since('2.2.1')
     def no_anticompaction_after_hostspecific_repair_test(self):
