@@ -34,6 +34,11 @@ class TestBootstrap(Tester):
         Tester.__init__(self, *args, **kwargs)
         self.allow_log_errors = True
 
+    def assert_bootstrap_state(self, node, state):
+        session = self.exclusive_cql_connection(node)
+        rows = session.execute("SELECT bootstrapped FROM system.local WHERE key='local'")
+        self.assertEqual(rows[0][0], state)
+
     def simple_bootstrap_test(self):
         cluster = self.cluster
         tokens = cluster.balanced_tokens(2)
@@ -91,6 +96,11 @@ class TestBootstrap(Tester):
         assert_almost_equal(float(initial_size - empty_size), 2 * (size1 - float(empty_size)))
 
     def keepalive_test(self):
+        """
+        @jira_ticket CASSANDRA-8343
+        Test that bootstrap completes if it takes longer than streaming_socket_timeout_in_ms
+        to process received data
+        """
         cluster = self.cluster
         tokens = cluster.balanced_tokens(2)
         cluster.set_configuration_options(values={'num_tokens': 1})
@@ -109,42 +119,21 @@ class TestBootstrap(Tester):
         self.create_ks(session, 'ks', 1)
         self.create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
 
-        # record the size before inserting any of our own data
-        empty_size = node1.data_size()
-        debug("node1 empty size : %s" % float(empty_size))
-
         insert_statement = session.prepare("INSERT INTO ks.cf (key, c1, c2) VALUES (?, 'value1', 'value2')")
         execute_concurrent_with_args(session, insert_statement, [['k%d' % k] for k in range(keys)])
 
         node1.flush()
         node1.compact()
-        initial_size = node1.data_size()
-        debug("node1 size before bootstrapping node2: %s" % float(initial_size))
 
-        # Reads inserted data all during the bootstrap process. We shouldn't
-        # get any error
-        reader = self.go(lambda _: query_c1c2(session, random.randint(0, keys - 1), ConsistencyLevel.ONE))
-
-        # Bootstraping a new node
+        # Bootstraping a new node with delay before completing
         node2 = new_node(cluster)
         node2.set_configuration_options(values={'initial_token': tokens[1], 'streaming_socket_timeout_in_ms': 1000})
-        node2.start(jvm_args=['-Dcassandra.test.sleep_before_complete_stream_task=2000'], wait_for_binary_proto=True)
-        node2.compact()
+        node2.start(jvm_args=['-Dcassandra.dtest.sleep_before_complete_stream_task=60000'], wait_for_binary_proto=True)
 
-        reader.check()
-        node1.cleanup()
-        debug("node1 size after cleanup: %s" % float(node1.data_size()))
-        node1.compact()
-        debug("node1 size after compacting: %s" % float(node1.data_size()))
-        time.sleep(.5)
-        reader.check()
+        # Shouldn't fail due to timeout
+        self.assert_bootstrap_state(node2, 'COMPLETED')
+        # Make sure keep-alive was triggered
 
-        debug("node2 size after compacting: %s" % float(node2.data_size()))
-
-        size1 = float(node1.data_size())
-        size2 = float(node2.data_size())
-        assert_almost_equal(size1, size2, error=0.3)
-        assert_almost_equal(float(initial_size - empty_size), 2 * (size1 - float(empty_size)))
 
     def simple_bootstrap_test_nodata(self):
         """
@@ -161,9 +150,7 @@ class TestBootstrap(Tester):
         node3 = new_node(cluster)
         node3.start(wait_for_binary_proto=True, wait_other_notice=True)
 
-        session = self.patient_exclusive_cql_connection(node3)
-        rows = session.execute("SELECT bootstrapped FROM system.local WHERE key='local'")
-        self.assertEqual(rows[0][0], 'COMPLETED')
+        self.assert_bootstrap_state(node3, 'COMPLETED')
 
     def read_from_bootstrapped_node_test(self):
         """
@@ -223,17 +210,14 @@ class TestBootstrap(Tester):
         node3.watch_log_for("Starting listening for CQL clients")
         mark = node3.mark_log()
         # check if node3 is still in bootstrap mode
-        session = self.patient_exclusive_cql_connection(node3)
-        rows = list(session.execute("SELECT bootstrapped FROM system.local WHERE key='local'"))
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][0], 'IN_PROGRESS')
+        self.assert_bootstrap_state(node3, 'IN_PROGRESS')
+
         # bring back node1 and invoke nodetool bootstrap to resume bootstrapping
         node1.start(wait_other_notice=True)
         node3.nodetool('bootstrap resume')
 
         node3.watch_log_for("Resume complete", from_mark=mark)
-        rows = list(session.execute("SELECT bootstrapped FROM system.local WHERE key='local'"))
-        self.assertEqual(rows[0][0], 'COMPLETED')
+        self.assert_bootstrap_state(node3, 'COMPLETED')
 
         # cleanup to guarantee each node will only have sstables of its ranges
         cluster.cleanup()
@@ -283,10 +267,7 @@ class TestBootstrap(Tester):
         node3.watch_log_for("Listening for thrift clients...", from_mark=mark)
 
         # check if 2nd bootstrap succeeded
-        session = self.patient_exclusive_cql_connection(node3)
-        rows = list(session.execute("SELECT bootstrapped FROM system.local WHERE key='local'"))
-        assert len(rows) == 1
-        assert rows[0][0] == 'COMPLETED', rows[0][0]
+        self.assert_bootstrap_state(node3, 'COMPLETED')
 
     def manual_bootstrap_test(self):
         """
