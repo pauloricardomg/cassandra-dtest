@@ -746,6 +746,30 @@ class TestRepair(Tester):
         (stdout, stderr) = node2.stress(['read', 'n=1M', '-rate', 'threads=30', '-node', node2.address()], capture_output=True)
         self.assertTrue(len(stderr) == 0, stderr)
 
+    def test_dead_coordinator(self):
+        cluster = self.cluster
+        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+        cluster.populate(3).start(wait_for_binary_proto=True)
+        node1, node2, node3 = cluster.nodelist()
+        node1.stress(['write', 'n=100k', '-schema', 'replication(factor=3)', '-rate', 'threads=30'])
+        if cluster.version() >= "2.2":
+            t1 = threading.Thread(target=node1.repair)
+        else:
+            t1 = threading.Thread(target=node1.nodetool, args=('repair keyspace1 standard1 -inc -par',))
+        t1.start()
+        time.sleep(3)
+        debug("stopping node1")
+        node1.stop(gently=False, wait_other_notice=True)
+        t1.join()
+        debug("starting node1 - first repair should have failed")
+        node1.start(wait_for_binary_proto=True, wait_other_notice=True)
+        debug("running second repair")
+        if cluster.version() >= "2.2":
+            node1.repair()
+        else:
+            node1.nodetool('repair keyspace1 standard1 -inc -par')
+
+
 RepairTableContents = namedtuple('RepairTableContents',
                                  ['parent_repair_history', 'repair_history'])
 
