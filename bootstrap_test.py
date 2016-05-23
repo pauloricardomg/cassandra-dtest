@@ -95,44 +95,39 @@ class TestBootstrap(Tester):
         assert_almost_equal(size1, size2, error=0.3)
         assert_almost_equal(float(initial_size - empty_size), 2 * (size1 - float(empty_size)))
 
-    def keepalive_test(self):
+    def simple_bootstrap_test_small_streaming_socket_timeout_in_ms(self):
         """
         @jira_ticket CASSANDRA-8343
         Test that bootstrap completes if it takes longer than streaming_socket_timeout_in_ms
-        to process received data
+        to receive a single sstable
         """
         cluster = self.cluster
         tokens = cluster.balanced_tokens(2)
-        cluster.set_configuration_options(values={'num_tokens': 1})
+        cluster.set_configuration_options(values={'num_tokens': 1, 'stream_throughput_outbound_megabits_per_sec': 1,
+                                          'streaming_socket_timeout_in_ms': 500})
 
         debug("[node1, node2] tokens: %r" % (tokens,))
-
-        keys = 10000
 
         # Create a single node cluster
         cluster.populate(1)
         node1 = cluster.nodelist()[0]
-        node1.set_configuration_options(values={'initial_token': tokens[0], 'streaming_socket_timeout_in_ms': 1000})
+        node1.set_configuration_options(values={'initial_token': tokens[0]})
         cluster.start(wait_other_notice=True)
 
-        session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
-        self.create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
+        # Add more than 1MB of data
+        node1.stress(['write', 'n=50K', '-rate', 'threads=8'])
 
-        insert_statement = session.prepare("INSERT INTO ks.cf (key, c1, c2) VALUES (?, 'value1', 'value2')")
-        execute_concurrent_with_args(session, insert_statement, [['k%d' % k] for k in range(keys)])
-
+        # Flush so everything will be on a single sstable
         node1.flush()
         node1.compact()
 
-        # Bootstraping a new node with delay before completing
+        # Bootstraping a new node with very small streaming_socket_timeout_in_ms
         node2 = new_node(cluster)
-        node2.set_configuration_options(values={'initial_token': tokens[1], 'streaming_socket_timeout_in_ms': 1000})
-        node2.start(jvm_args=['-Dcassandra.dtest.sleep_before_complete_stream_task=60000'], wait_for_binary_proto=True)
+        node2.set_configuration_options(values={'initial_token': tokens[1]})
+        node2.start(wait_for_binary_proto=True)
 
-        # Shouldn't fail due to timeout
+        # Shouldn't fail due to streaming socket timeout timeout
         self.assert_bootstrap_state(node2, 'COMPLETED')
-        # Make sure keep-alive was triggered
 
 
     def simple_bootstrap_test_nodata(self):
