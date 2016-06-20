@@ -210,7 +210,7 @@ class TestRepair(Tester):
 
         # Forcing cluster version on purpose
         debug("Starting cluster..")
-        cluster.set_install_dir(version="2.1.9")
+        cluster.set_install_dir(version="2.2.4")
         self._populate_cluster()
 
         self._do_upgrade(default_install_dir)
