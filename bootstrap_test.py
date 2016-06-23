@@ -135,17 +135,30 @@ class TestBootstrap(Tester):
     @known_failure(failure_source='cassandra',
                    jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11414',
                    flaky=True)
-    @since('2.2')
-    def resumable_bootstrap_test(self):
+    @since('2.1')
+    def fail_bootstrap_compressed_test(self):
         """
-        Test resuming bootstrap after data streaming failure
+        Test bootstrap fails when bootstrapping a new node with
+        compressed tables and a source node fails during streaming
+        @jira_ticket CASSANDRA-10992
         """
+        self._test_fail_bootstrap(compressed=True)
 
+    def _test_fail_bootstrap(self, compressed=False):
+        """
+        In a cluster with 2 nodes, try bootstrapping a new node (node3
+        and fails node1 during streaming - expect bootstrap to fail
+        """
         cluster = self.cluster
+        cluster.set_configuration_options(values={'stream_throughput_outbound_megabits_per_sec': 1})
         cluster.populate(2).start(wait_other_notice=True)
 
         node1 = cluster.nodes['node1']
-        node1.stress(['write', 'n=100K', 'cl=TWO', '-schema', 'replication(factor=2)', '-rate', 'threads=50'])
+        stress_opts = ['write', 'n=100K', 'cl=TWO', '-schema', 'replication(factor=2)', '-rate', 'threads=50']
+        if compressed:
+            stress_opts = ['write', 'n=100K', 'cl=TWO', '-schema', 'replication(factor=2)',
+                           'compression=LZ4Compressor', '-rate', 'threads=50']
+        node1.stress(stress_opts)
         cluster.flush()
 
         # kill node1 in the middle of streaming to let it fail
@@ -154,18 +167,33 @@ class TestBootstrap(Tester):
 
         # start bootstrapping node3 and wait for streaming
         node3 = new_node(cluster)
-        node3.set_configuration_options(values={'stream_throughput_outbound_megabits_per_sec': 1})
         # keep timeout low so that test won't hang
-        node3.set_configuration_options(values={'streaming_socket_timeout_in_ms': 1000})
-        try:
-            node3.start(wait_other_notice=False)
-        except NodeError:
-            pass  # node doesn't start as expected
+        node3.set_configuration_options(values={'streaming_socket_timeout_in_ms': 30000})
+        node3.start(wait_other_notice=False)
+
         t.join()
+
+        node3.watch_log_for("org.apache.cassandra.streaming.StreamException: Stream failed", timeout=300)
+
+    @known_failure(failure_source='cassandra',
+                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11414',
+                   flaky=True)
+    @since('2.2')
+    def resumable_bootstrap_test(self):
+        """
+        Test resuming bootstrap after data streaming failure
+        """
+        cluster = self.cluster
+
+        # This test tries to bootstrap node3 and fails during streaming
+        self._test_fail_bootstrap()
+
+        node1, node2, node3 = cluster.nodelist()
 
         # wait for node3 ready to query
         node3.watch_log_for("Starting listening for CQL clients")
         mark = node3.mark_log()
+
         # check if node3 is still in bootstrap mode
         session = self.patient_exclusive_cql_connection(node3)
         rows = list(session.execute("SELECT bootstrapped FROM system.local WHERE key='local'"))
