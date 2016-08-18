@@ -6,7 +6,6 @@ import tempfile
 from cassandra import ConsistencyLevel, ReadTimeout, Unavailable
 from cassandra.query import SimpleStatement
 from ccmlib.node import Node
-from nose.plugins.attrib import attr
 
 from dtest import DISABLE_VNODES, Tester, debug
 from tools import known_failure, since, rows_to_list
@@ -243,14 +242,12 @@ class TestReplaceAddress(BaseReplaceAddressTest):
                    jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11652',
                    flaky=True,
                    notes='windows')
-    @attr('resource-intensive')
     def replace_stopped_node_test(self):
         """
         Test that we can replace a node that is not shutdown gracefully.
         """
         self._test_replace_node()
 
-    @attr('resource-intensive')
     def replace_shutdown_node_test(self):
         """
         @jira_ticket CASSANDRA-9871
@@ -258,7 +255,6 @@ class TestReplaceAddress(BaseReplaceAddressTest):
         """
         self._test_replace_node(gently=True)
 
-    @attr('resource-intensive')
     def replace_stopped_node_same_address_test(self):
         """
         @jira_ticket CASSANDRA-8523
@@ -266,7 +262,6 @@ class TestReplaceAddress(BaseReplaceAddressTest):
         """
         self._test_replace_node(same_address=True)
 
-    @attr('resource-intensive')
     def replace_first_boot_test(self):
         self._test_replace_node(jvm_option='replace_address_first_boot')
 
@@ -300,7 +295,6 @@ class TestReplaceAddress(BaseReplaceAddressTest):
 
         self._verify_data(initial_data)
 
-    @attr('resource-intensive')
     def replace_active_node_test(self):
         self.ignore_log_patterns.extend([r'Exception encountered during startup'])
         self._setup(n=3)
@@ -310,7 +304,6 @@ class TestReplaceAddress(BaseReplaceAddressTest):
         self.replacement_node.watch_log_for("java.lang.UnsupportedOperationException: Cannot replace a live node...")
         assert_not_running(self.replacement_node)
 
-    @attr('resource-intensive')
     def replace_nonexistent_node_test(self):
         self.ignore_log_patterns.extend([
             # This is caused by starting a node improperly (replacing active/nonexistent)
@@ -433,7 +426,6 @@ class TestReplaceAddress(BaseReplaceAddressTest):
                    flaky=True,
                    notes='windows')
     @since('2.2')
-    @attr('resource-intensive')
     def resume_failed_replace_test(self):
         """
         Test resumable bootstrap while replacing node. Feature introduced in
@@ -446,13 +438,11 @@ class TestReplaceAddress(BaseReplaceAddressTest):
     @known_failure(failure_source='test',
                    jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11835')
     @since('2.2')
-    @attr('resource-intensive')
     def restart_failed_replace_with_reset_resume_state_test(self):
         """Test replace with resetting bootstrap progress"""
         self._test_restart_failed_replace(mode='reset_resume_state')
 
     @since('2.2')
-    @attr('resource-intensive')
     def restart_failed_replace_test(self):
         """
         Test that if a node fails to replace, it can join the cluster even if the data is wiped.
