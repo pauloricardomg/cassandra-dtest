@@ -16,6 +16,7 @@ from enum import Enum  # Remove when switching to py3
 from nose.plugins.attrib import attr
 from nose.tools import (assert_equal)
 
+from distutils.version import LooseVersion
 from dtest import Tester, debug, get_ip_from_node, create_ks
 from tools.assertions import (assert_all, assert_crc_check_chance_equal,
                               assert_invalid, assert_none, assert_one,
@@ -1732,6 +1733,8 @@ class TestMaterializedViewsLockcontention(Tester):
 
     def _prepare_cluster(self):
         self.cluster.populate(1)
+        self.supports_v5_protocol = self.cluster.version() >= LooseVersion('3.10')
+        self.protocol_version = 5 if self.supports_v5_protocol else 4
 
         self.cluster.set_configuration_options(values={
             'concurrent_materialized_view_writes': 1,
@@ -1745,7 +1748,7 @@ class TestMaterializedViewsLockcontention(Tester):
             "-Dcassandra.test.fail_mv_locks_count=64"
         ])
 
-        session = self.patient_exclusive_cql_connection(self.nodes[0], protocol_version=5)
+        session = self.patient_exclusive_cql_connection(self.nodes[0], protocol_version=self.protocol_version)
 
         keyspace = "locktest"
         session.execute("""
