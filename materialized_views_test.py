@@ -662,6 +662,13 @@ class TestMaterializedViews(Tester):
         for i in xrange(1000):
             session.execute("INSERT INTO t (id, v, v2, v3) VALUES ({v}, {v}, 'a', 3.0)".format(v=i))
 
+        # CASSANDRA-13069 - Test that replayed mutations are removed from the batchlog
+        self._replay_batchlogs()
+        for node in self.cluster.nodelist():
+            node_session = self.patient_exclusive_cql_connection(node, protocol_version=self.protocol_version)
+            result = list(node_session.execute("SELECT count(*) FROM system.batches;"))
+            self.assertEqual(result[0].count, 0)
+
         for i in xrange(1000):
             assert_one(session, "SELECT * FROM t_by_v WHERE v = {v}".format(v=i), [i, i, 'a', 3.0])
 
