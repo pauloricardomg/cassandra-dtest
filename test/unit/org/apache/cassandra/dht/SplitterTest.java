@@ -27,11 +27,25 @@ import java.util.Set;
 
 import org.junit.Test;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 public class SplitterTest
 {
+    static Random r;
+    static
+    {
+        long seed = System.nanoTime();
+        // seed = 198694699301413L;
+        System.out.println("Seed " + seed);
+        r = new Random(seed);
+    }
+
+    public Murmur3Partitioner.LongToken lt(long l)
+    {
+        return new Murmur3Partitioner.LongToken(l);
+    }
 
     @Test
     public void randomSplitTestNoVNodesRandomPartitioner()
@@ -59,7 +73,6 @@ public class SplitterTest
     public void randomSplitTestNoVNodes(IPartitioner partitioner)
     {
         Splitter splitter = partitioner.splitter().get();
-        Random r = new Random();
         for (int i = 0; i < 10000; i++)
         {
             List<Range<Token>> localRanges = generateLocalRanges(1, r.nextInt(4)+1, splitter, r, partitioner instanceof RandomPartitioner);
@@ -71,7 +84,6 @@ public class SplitterTest
     public void randomSplitTestVNodes(IPartitioner partitioner)
     {
         Splitter splitter = partitioner.splitter().get();
-        Random r = new Random();
         for (int i = 0; i < 10000; i++)
         {
             // we need many tokens to be able to split evenly over the disks
@@ -80,9 +92,26 @@ public class SplitterTest
             int parts = r.nextInt(5)+1;
             List<Range<Token>> localRanges = generateLocalRanges(numTokens, rf, splitter, r, partitioner instanceof RandomPartitioner);
             List<Token> boundaries = splitter.splitOwnedRanges(parts, localRanges, true);
+
             if (!assertRangeSizeEqual(localRanges, boundaries, partitioner, splitter, false))
                 fail(String.format("Could not split %d tokens with rf=%d into %d parts (localRanges=%s, boundaries=%s)", numTokens, rf, parts, localRanges, boundaries));
         }
+    }
+
+    @Test
+    public void fallBackToEvenRangesOnUnderflow()
+    {
+        Splitter splitter = Murmur3Partitioner.instance.splitter().get();
+
+        int parts = 3;
+        List<Range<Token>> localRanges = new ArrayList<>();
+
+        localRanges.add(new Range<Token>(lt(-9223372036854775808L), lt(-6639341390736545756L)));
+        localRanges.add(new Range<Token>(lt(-6639341390736545756L), lt(-2688160409776496397L)));
+        localRanges.add(new Range<Token>(lt(-2688160409776496397L), lt(-9223372036854775808L)));
+
+        assertEquals(splitter.splitOwnedRanges(parts, localRanges, true), splitter.splitOwnedRanges(parts, localRanges, false));
+
     }
 
     private boolean assertRangeSizeEqual(List<Range<Token>> localRanges, List<Token> tokens, IPartitioner partitioner, Splitter splitter, boolean splitIndividualRanges)

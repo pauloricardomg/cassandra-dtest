@@ -56,7 +56,12 @@ public abstract class Splitter
             return Collections.singletonList(partitioner.getMaximumToken());
 
         if (dontSplitRanges)
-            return splitOwnedRangesNoPartialRanges(localRanges, perPart, parts);
+        {
+            List<Token> boundaries = splitOwnedRangesNoPartialRanges(localRanges, perPart, parts);
+            // If we can't split by ranges, split evenly to ensure utilisation of all disks
+            if (boundaries.size() == parts)
+                return boundaries;
+        }
 
         List<Token> boundaries = new ArrayList<>();
         BigInteger sum = BigInteger.ZERO;
@@ -77,7 +82,7 @@ public abstract class Splitter
         }
         boundaries.set(boundaries.size() - 1, partitioner.getMaximumToken());
 
-        assert boundaries.size() == parts : boundaries.size() +"!="+parts+" "+boundaries+":"+localRanges;
+        assert boundaries.size() == parts : boundaries.size() + "!=" + parts + " " + boundaries + ":" + localRanges;
         return boundaries;
     }
 
@@ -85,8 +90,10 @@ public abstract class Splitter
     {
         List<Token> boundaries = new ArrayList<>(parts);
         BigInteger sum = BigInteger.ZERO;
+
         int i = 0;
-        while (boundaries.size() < parts - 1)
+        final int rangesCount = localRanges.size();
+        while (boundaries.size() < parts - 1 && i < rangesCount - 1)
         {
             Range<Token> r = localRanges.get(i);
             Range<Token> nextRange = localRanges.get(i + 1);
@@ -96,6 +103,7 @@ public abstract class Splitter
             BigInteger currentRangeWidth = valueForToken(right).subtract(valueForToken(r.left));
             BigInteger nextRangeWidth = valueForToken(nextRight).subtract(valueForToken(nextRange.left));
             sum = sum.add(currentRangeWidth);
+
             // does this or next range take us beyond the per part limit?
             if (sum.compareTo(perPart) > 0 || sum.add(nextRangeWidth).compareTo(perPart) > 0)
             {
