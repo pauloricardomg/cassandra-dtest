@@ -974,6 +974,165 @@ class TestMaterializedViews(Tester):
                 cl=ConsistencyLevel.ALL
             )
 
+    @since('3.0')
+    def test_base_column_in_view_pk_complex_timestamp_with_flush(self):
+        self._test_base_column_in_view_pk_complex_timestamp(flush=True)
+
+    @since('3.0')
+    def test_base_column_in_view_pk_complex_timestamp_without_flush(self):
+        self._test_base_column_in_view_pk_complex_timestamp(flush=False)
+
+    def _test_base_column_in_view_pk_complex_timestamp(self, flush):
+        """
+        Able to shadow old view row with column ts greater than pk's ts and re-insert the view row
+        Able to shadow old view row with column ts smaller than pk's ts and re-insert the view row
+
+        @jira_ticket CASSANDRA-11500
+        """
+        session = self.prepare(rf=3, nodes=3, options={'hinted_handoff_enabled': False}, consistency_level=ConsistencyLevel.QUORUM)
+        node1, node2, node3 = self.cluster.nodelist()
+
+        session.execute('USE ks')
+        session.execute("CREATE TABLE t (k int PRIMARY KEY, a int, b int)")
+        session.execute(("CREATE MATERIALIZED VIEW mv AS SELECT * FROM t "
+                         "WHERE k IS NOT NULL AND a IS NOT NULL PRIMARY KEY (k, a)"))
+        session.cluster.control_connection.wait_for_schema_agreement()
+
+        # Set initial values TS=1
+        session.execute(SimpleStatement("INSERT INTO t (k, a, b) VALUES (1, 1, 1) USING TIMESTAMP 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT * FROM t", [1, 1, 1])
+        assert_one(session, "SELECT * FROM mv", [1, 1, 1])
+
+        # increase b ts to 10
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 10 SET b = 2 WHERE k = 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, 1, 2, 10])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 1, 2, 10])
+
+        # switch entries. shadow a = 1, insert a = 2
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 2 SET a = 2 WHERE k = 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, 2, 2, 10])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 2, 2, 10])
+
+        # switch entries. shadow a = 2, insert a = 1
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 3 SET a = 1 WHERE k = 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, 1, 2, 10])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 1, 2, 10])
+
+        # switch entries. shadow a = 1, insert a = 2
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 4 SET a = 2 WHERE k = 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+            self.cluster.compact()
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, 2, 2, 10])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 2, 2, 10])
+
+        # able to shadow view row even if base-column in view pk's ts is smaller than row timestamp
+        # set row TS = 20, a@6, b@20
+        session.execute(SimpleStatement("DELETE FROM t USING TIMESTAMP 5 where k = 1;"))
+        if flush:
+            self.cluster.flush()
+        session.execute(SimpleStatement("INSERT INTO t (k, a, b) VALUES (1, 1, 1) USING TIMESTAMP 6;"))
+        if flush:
+            self.cluster.flush()
+        session.execute(SimpleStatement("INSERT INTO t (k, b) VALUES (1, 1) USING TIMESTAMP 20;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, 1, 1, 20])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 1, 1, 20])
+
+        # switch entries. shadow a = 1, insert a = 2
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 7 SET a = 2 WHERE k = 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT k,a,b,writetime(a),writetime(b) FROM t", [1, 2, 1, 7, 20])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 2, 1, 20])
+
+        # switch entries. shadow a = 2, insert a = 1
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 8 SET a = 1 WHERE k = 1;"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT k,a,b,writetime(a),writetime(b) FROM t", [1, 1, 1, 8, 20])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 1, 1, 20])
+
+        # create another view row
+        session.execute(SimpleStatement("INSERT INTO t (k, a, b) VALUES (2, 2, 2);"))
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        assert_one(session, "SELECT k,a,b FROM t WHERE k = 2", [2, 2, 2])
+        assert_one(session, "SELECT k,a,b FROM mv WHERE k = 2", [2, 2, 2])
+
+        # stop node2, node3
+        debug('Shutdown node2')
+        node2.stop(wait_other_notice=True)
+        debug('Shutdown node3')
+        node3.stop(wait_other_notice=True)
+        # shadow a = 1, create a = 2
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 9 SET a = 2 WHERE k = 1",
+                                        consistency_level=ConsistencyLevel.ONE))
+        # shadow (a=2, k=2) after 3 second
+        session.execute(SimpleStatement("UPDATE t USING TTL 3 SET a = 2 WHERE k = 2",
+                                        consistency_level=ConsistencyLevel.ONE))
+        self._replay_batchlogs()
+
+        debug('Starting node2')
+        node2.start(wait_other_notice=True)
+        debug('Starting node3')
+        node3.start(wait_other_notice=True)
+
+        # We should get a digest mismatch of tombstones and repaired
+        query = SimpleStatement("SELECT * FROM mv WHERE k = 1 AND a = 1", consistency_level=ConsistencyLevel.ALL)
+        result = session.execute(query, trace=True)
+        self.check_trace_events(result.get_query_trace(), True)
+        self.assertEqual(0, len(result.current_rows))
+
+        # second time no digest mismatch
+        result = session.execute(query, trace=True)
+        self.check_trace_events(result.get_query_trace(), False)
+        assert_none(session, "SELECT * FROM mv WHERE k = 1 AND a = 1")
+        self.assertEqual(0, len(result.current_rows))
+
+        # We should get a digest mismatch of data and repaired for a = 2
+        query = SimpleStatement("SELECT * FROM mv WHERE k = 1 AND a = 2", consistency_level=ConsistencyLevel.ALL)
+        result = session.execute(query, trace=True)
+        self.check_trace_events(result.get_query_trace(), True)
+        self.assertEqual(1, len(result.current_rows))
+
+        # second time no digest mismatch
+        result = session.execute(query, trace=True)
+        self.check_trace_events(result.get_query_trace(), False)
+        self.assertEqual(1, len(result.current_rows))
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv WHERE k = 1", [1, 2, 1, 20])
+
+        time.sleep(3)
+        # We should get a digest mismatch of tombstones and repaired
+        query = SimpleStatement("SELECT * FROM mv WHERE k = 2 AND a = 2", consistency_level=ConsistencyLevel.ALL)
+        result = session.execute(query, trace=True)
+        self.check_trace_events(result.get_query_trace(), True)
+        debug(result.current_rows)
+        self.assertEqual(0, len(result.current_rows))
+
+        # second time no digest mismatch
+        result = session.execute(query, trace=True)
+        self.check_trace_events(result.get_query_trace(), False)
+        self.assertEqual(0, len(result.current_rows))
+
     def view_tombstone_test(self):
         """
         Test that a materialized views properly tombstone
