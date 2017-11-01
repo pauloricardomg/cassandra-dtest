@@ -574,7 +574,7 @@ def stress_write(node, keycount=100000):
     node.stress(['write', 'n={keycount}'.format(keycount=keycount)])
 
 
-strategies = ['LeveledCompactionStrategy', 'SizeTieredCompactionStrategy', 'DateTieredCompactionStrategy']
+strategies = ['LeveledCompactionStrategy', 'SizeTieredCompactionStrategy', 'DateTieredCompactionStrategy', 'TimeWindowCompactionStrategy']
 for strategy in strategies:
     cls_name = ('TestCompaction_with_' + strategy)
     vars()[cls_name] = type(cls_name, (TestCompaction,), {'strategy': strategy, '__test__': True})
