@@ -127,6 +127,22 @@ class TestMaterializedViews(Tester):
                     time.sleep(1)
                     attempts -= 1
 
+    def _wait_for_view_build_start(self, session, ks, view, wait_minutes=2):
+        """Wait for the start of a MV build, ensuring that it has saved some progress"""
+        start = time.time()
+        while True:
+            try:
+                query = "SELECT COUNT(*) FROM %s WHERE keyspace_name='%s' AND view_name='%s'" %\
+                        (self._build_progress_table(), ks, view)
+                result = list(session.execute(query))
+                self.assertEqual(result[0].count, 0)
+            except AssertionError:
+                break
+
+            elapsed = (time.time() - start) / 60
+            if elapsed > wait_minutes:
+                self.fail("The MV build hasn't started in 2 minutes.")
+
     def _insert_data(self, session):
         # insert data
         insert_stmt = "INSERT INTO users (username, password, gender, state, birth_year) VALUES "
@@ -943,7 +959,7 @@ class TestMaterializedViews(Tester):
                 [i, i, 'a', 3.0]
             )
 
-    def interrupt_build_process_test(self):
+    def test_interrupt_build_process(self):
         """Test that an interrupted MV build process is resumed as it should"""
 
         options = {'hinted_handoff_enabled': False}
@@ -975,18 +991,7 @@ class TestMaterializedViews(Tester):
                          "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v, id)"))
 
         debug("Wait and ensure the MV build has started. Waiting up to 2 minutes.")
-        start = time.time()
-        while True:
-            try:
-                query = "SELECT COUNT(*) FROM %s WHERE keyspace_name='ks' AND view_name='t_by_v'"
-                result = list(session.execute((query % self._build_progress_table())))
-                self.assertEqual(result[0].count, 0)
-            except AssertionError:
-                break
-
-            elapsed = (time.time() - start) / 60
-            if elapsed > 2:
-                self.fail("The MV build hasn't started in 2 minutes.")
+        self._wait_for_view_build_start(session, 'ks', 't_by_v', wait_minutes=2)
 
         debug("Stop the cluster. Interrupt the MV build process.")
         self.cluster.stop()
@@ -1023,7 +1028,7 @@ class TestMaterializedViews(Tester):
             self.assertTrue(node.grep_log('Resuming view build', filename='debug.log'))
 
     @since('4.0')
-    def remove_while_building_test(self):
+    def test_drop_while_building(self):
         """Test that a parallel MV build is interrupted when the view is removed"""
 
         session = self.prepare(options={'concurrent_materialized_view_builders': 4}, install_byteman=True)
@@ -1047,7 +1052,7 @@ class TestMaterializedViews(Tester):
         debug("Verify that the build has been stopped before its finalization without errors")
         for node in self.cluster.nodelist():
             self.check_logs_for_errors()
-            self.assertFalse(node.grep_log('Marking view\(ks.t_by_v\) as built', filename='debug.log'))
+            self.assertFalse(node.grep_log('Marking view', filename='debug.log'))
             self.assertTrue(node.grep_log('Stopping current view builder due to schema change', filename='debug.log'))
 
         debug("Verify that the view has been removed")
@@ -1065,6 +1070,113 @@ class TestMaterializedViews(Tester):
         debug("Verify that the MV has been successfully created")
         self._wait_for_view('ks', 't_by_v')
         assert_one(session, "SELECT COUNT(*) FROM t_by_v", [10000])
+
+    @since('4.0')
+    def test_drop_with_stopped_build(self):
+        """Test that MV whose build has been stopped with `nodetool stop` can be dropped"""
+
+        session = self.prepare(options={'concurrent_materialized_view_builders': 4}, install_byteman=True)
+        session.execute("CREATE TABLE t (id int PRIMARY KEY, v int, v2 text, v3 decimal)")
+        nodes = self.cluster.nodelist()
+
+        debug("Inserting initial data")
+        for i in xrange(10000):
+            session.execute("INSERT INTO t (id, v, v2, v3) VALUES ({v}, {v}, 'a', 3.0) IF NOT EXISTS".format(v=i))
+
+        debug("Slowing down MV build with byteman")
+        for node in nodes:
+            node.byteman_submit(['./byteman/4.0/view_builder_task_sleep.btm'])
+
+        debug("Create a MV")
+        session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t "
+                         "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v, id)"))
+
+        debug("Wait and ensure the MV build has started. Waiting up to 2 minutes.")
+        self._wait_for_view_build_start(session, 'ks', 't_by_v', wait_minutes=2)
+
+        debug("Stopping all running view build tasks with nodetool")
+        for node in nodes:
+            node.nodetool('stop VIEW_BUILD')
+
+        debug("Checking logs to verify that some view build tasks have been stopped")
+        for node in nodes:
+            node.watch_log_for('Stopped build for view', filename='debug.log', timeout=60)
+            node.watch_log_for('Compaction interrupted: View build', filename='system.log', timeout=60)
+            self.check_logs_for_errors()
+
+        debug("Drop the MV while it is still building")
+        session.execute("DROP MATERIALIZED VIEW t_by_v")
+
+        debug("Verify that the build has been stopped before its finalization without errors")
+        for node in nodes:
+            self.check_logs_for_errors()
+            self.assertFalse(node.grep_log('Marking view', filename='debug.log'))
+            self.assertTrue(node.grep_log('Stopping current view builder due to schema change', filename='debug.log'))
+
+        debug("Verify that the view has been removed")
+        failed = False
+        try:
+            session.execute("SELECT COUNT(*) FROM t_by_v")
+        except InvalidRequest:
+            failed = True
+        self.assertTrue(failed, "The view shouldn't be queryable")
+
+        debug("Create the MV again")
+        session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t "
+                         "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v, id)"))
+
+        debug("Verify that the MV has been successfully created")
+        self._wait_for_view('ks', 't_by_v')
+        assert_one(session, "SELECT COUNT(*) FROM t_by_v", [10000])
+
+    @since('4.0')
+    def test_resume_stopped_build(self):
+        """Test that MV builds stopped with `nodetool stop` are resumed after restart"""
+
+        session = self.prepare(options={'concurrent_materialized_view_builders': 4}, install_byteman=True)
+        session.execute("CREATE TABLE t (id int PRIMARY KEY, v int, v2 text, v3 decimal)")
+        nodes = self.cluster.nodelist()
+
+        debug("Inserting initial data")
+        for i in xrange(10000):
+            session.execute("INSERT INTO t (id, v, v2, v3) VALUES ({v}, {v}, 'a', 3.0) IF NOT EXISTS".format(v=i))
+
+        debug("Slowing down MV build with byteman")
+        for node in nodes:
+            node.byteman_submit(['./byteman/4.0/view_builder_task_sleep.btm'])
+
+        debug("Create a MV")
+        session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t "
+                         "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v, id)"))
+
+        debug("Wait and ensure the MV build has started. Waiting up to 2 minutes.")
+        self._wait_for_view_build_start(session, 'ks', 't_by_v', wait_minutes=2)
+
+        debug("Stopping all running view build tasks with nodetool")
+        for node in nodes:
+            node.nodetool('stop VIEW_BUILD')
+
+        debug("Checking logs to verify that some view build tasks have been stopped")
+        for node in nodes:
+            node.watch_log_for('Stopped build for view', filename='debug.log', timeout=60)
+            node.watch_log_for('Compaction interrupted: View build', filename='system.log', timeout=60)
+            self.check_logs_for_errors()
+
+        debug("Restart the cluster")
+        self.cluster.stop()
+        marks = [node.mark_log() for node in nodes]
+        self.cluster.start(wait_for_binary_proto=True)
+        session = self.patient_cql_connection(nodes[0])
+
+        debug("Verify that the MV has been successfully created")
+        self._wait_for_view('ks', 't_by_v')
+        assert_one(session, "SELECT COUNT(*) FROM ks.t_by_v", [10000])
+
+        debug("Checking logs to verify that the view build has been resumed and completed after restart")
+        for node, mark in zip(nodes, marks):
+            self.assertTrue(node.grep_log('Resuming view build', filename='debug.log', from_mark=mark))
+            self.assertTrue(node.grep_log('Marking view', filename='debug.log', from_mark=mark))
+            self.check_logs_for_errors()
 
     @since('3.0')
     def test_no_base_column_in_view_pk_complex_timestamp_with_flush(self):
