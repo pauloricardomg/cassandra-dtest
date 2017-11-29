@@ -1091,11 +1091,9 @@ class TestMaterializedViews(Tester):
         session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t "
                          "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v, id)"))
 
-        debug("Wait and ensure the MV build has started. Waiting up to 2 minutes.")
-        self._wait_for_view_build_start(session, 'ks', 't_by_v', wait_minutes=2)
-
         debug("Stopping all running view build tasks with nodetool")
         for node in nodes:
+            node.watch_log_for('Starting new view build for range', filename='debug.log', timeout=60)
             node.nodetool('stop VIEW_BUILD')
 
         debug("Checking logs to verify that some view build tasks have been stopped")
@@ -1149,11 +1147,9 @@ class TestMaterializedViews(Tester):
         session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t "
                          "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v, id)"))
 
-        debug("Wait and ensure the MV build has started. Waiting up to 2 minutes.")
-        self._wait_for_view_build_start(session, 'ks', 't_by_v', wait_minutes=2)
-
         debug("Stopping all running view build tasks with nodetool")
         for node in nodes:
+            node.watch_log_for('Starting new view build for range', filename='debug.log', timeout=60)
             node.nodetool('stop VIEW_BUILD')
 
         debug("Checking logs to verify that some view build tasks have been stopped")
