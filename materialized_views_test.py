@@ -126,6 +126,8 @@ class TestMaterializedViews(Tester):
                 while attempts > 0 and not _view_build_finished(node):
                     time.sleep(1)
                     attempts -= 1
+                if attempts <= 0:
+                    raise RuntimeError("View {}.{} build not finished after 50 seconds.".format(ks, view))
 
     def _wait_for_view_build_start(self, session, ks, view, wait_minutes=2):
         """Wait for the start of a MV build, ensuring that it has saved some progress"""
@@ -1156,7 +1158,12 @@ class TestMaterializedViews(Tester):
         for node in nodes:
             node.watch_log_for('Stopped build for view', filename='debug.log', timeout=60)
             node.watch_log_for('Compaction interrupted: View build', filename='system.log', timeout=60)
+            node.watch_log_for('Interrupted build for view', filename='debug.log', timeout=60)
+            self.assertFalse(node.grep_log('Marking view', filename='debug.log'))
             self.check_logs_for_errors()
+
+        debug("Check that MV shouldn't be built yet.")
+        self.assertNotEqual(len(list(session.execute("SELECT COUNT(*) FROM t_by_v"))), 10000)
 
         debug("Restart the cluster")
         self.cluster.stop()
