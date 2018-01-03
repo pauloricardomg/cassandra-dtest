@@ -1181,6 +1181,73 @@ class TestMaterializedViews(Tester):
             self.assertTrue(node.grep_log('Marking view', filename='debug.log', from_mark=mark))
             self.check_logs_for_errors()
 
+    @since('4.0')
+    def test_bootstrap_after_stopped_build(self):
+        self._test_bootstrap(stop=True)
+
+    @since('4.0')
+    def test_bootstrap_after_successful_build(self):
+        self._test_bootstrap(stop=False)
+
+    def _test_bootstrap(self, stop):
+        """
+           Test that views are rebuild on the destination node during streaming if
+           the source node did not finish building all views for the streamed base table.
+           @jira_ticket CASSANDRA-13762
+        """
+
+        session = self.prepare(options={'concurrent_materialized_view_builders': 4}, install_byteman=True)
+        session.execute("CREATE TABLE t (id int PRIMARY KEY, v int, v2 text, v3 decimal)")
+        nodes = self.cluster.nodelist()
+
+        debug("Inserting initial data")
+        for i in xrange(10000):
+            session.execute("INSERT INTO t (id, v, v2, v3) VALUES ({v}, {v}, 'a', 3.0) IF NOT EXISTS".format(v=i))
+
+        if stop:
+            debug("Slowing down MV build with byteman")
+            for node in nodes:
+                node.byteman_submit(['./byteman/4.0/view_builder_task_sleep.btm'])
+
+        debug("Create a MV")
+        session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t "
+                         "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v, id)"))
+
+        if stop:
+            debug("Stopping all running view build tasks with nodetool")
+            for node in nodes:
+                node.watch_log_for('Starting new view build for range', filename='debug.log', timeout=60)
+                node.nodetool('stop VIEW_BUILD')
+
+            debug("Check that MV shouldn't be built yet.")
+            self.assertNotEqual(len(list(session.execute("SELECT COUNT(*) FROM t_by_v"))), 10000)
+        else:
+            debug("wait for view to build")
+            self._wait_for_view("ks", "t_by_v")
+
+        debug("Bootstrapping new node")
+        node4 = new_node(self.cluster)
+        node4.start(wait_other_notice=True, wait_for_binary_proto=True)
+
+        if stop:
+            debug("Checking that new node built the views which were not yet built")
+            node4.watch_log_for('Peer /.* did not build all views for base table ks.t. Rebuilding views during streaming.', timeout=60)
+        else:
+            debug("Checking that new node did not rebuild the views which were already built")
+            node4.watch_log_for('Peer /.* already built all views for base table ks.t. Skipping view rebuild.', timeout=60)
+        node4.watch_log_for('View already marked built for ks.t_by_v', filename='debug.log')
+
+        if stop:
+            debug("Restart the cluster")
+            self.cluster.stop()
+            marks = [node.mark_log() for node in nodes]
+            self.cluster.start(wait_for_binary_proto=True)
+            session = self.patient_cql_connection(nodes[0])
+
+        debug("Verify that the MV has been successfully created")
+        self._wait_for_view('ks', 't_by_v')
+        assert_one(session, "SELECT COUNT(*) FROM ks.t_by_v", [10000])
+
     @since('3.0')
     def test_mv_with_default_ttl_with_flush(self):
         self._test_mv_with_default_ttl(True)
