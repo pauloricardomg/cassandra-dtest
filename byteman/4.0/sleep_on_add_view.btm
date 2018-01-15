@@ -1,0 +1,10 @@
+RULE sleep 5s on adding new view to schema
+CLASS org.apache.cassandra.schema.Schema
+METHOD createView
+AT ENTRY
+# set flag to only run this rule once.
+IF NOT flagged("done")
+DO
+   flag("done");
+   Thread.sleep(5000)
+ENDRULE

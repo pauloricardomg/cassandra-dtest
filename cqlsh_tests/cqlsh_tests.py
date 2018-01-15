@@ -1531,7 +1531,7 @@ Tracing session:""")
         @jira_ticket CASSANDRA-9961 and CASSANDRA-10348
         """
         self.cluster.populate(1)
-        self.cluster.start(wait_for_binary_proto=True)
+        self.cluster.start(jvm_args=['-Dcassandra.mv.builder.gossip_settle_wait_in_ms=3000'], wait_for_binary_proto=True)
         node1, = self.cluster.nodelist()
         session = self.patient_cql_connection(node1)
 
