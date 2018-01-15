@@ -46,12 +46,13 @@ class TestMaterializedViews(Tester):
         new_list = [list(row) for row in rows]
         return new_list
 
-    def prepare(self, user_table=False, rf=1, options=None, nodes=3, install_byteman=False, **kwargs):
+    def prepare(self, user_table=False, rf=1, options=None, nodes=3,
+                install_byteman=False, jvm_args=None, **kwargs):
         cluster = self.cluster
         cluster.populate([nodes, 0], install_byteman=install_byteman)
         if options:
             cluster.set_configuration_options(values=options)
-        cluster.start()
+        cluster.start(jvm_args=jvm_args, **kwargs)
         node1 = cluster.nodelist()[0]
 
         session = self.patient_cql_connection(node1, **kwargs)
@@ -252,16 +253,40 @@ class TestMaterializedViews(Tester):
         for i in xrange(1000):
             assert_one(session, "SELECT * FROM t_by_v WHERE v = {}".format(i), [i, i])
 
+    def view_build_after_slow_schema_propagation_test(self):
+        self._populate_mv_after_insert_wide_rows_test(slow_propagation=True)
+
     def populate_mv_after_insert_wide_rows_test(self):
+        self._populate_mv_after_insert_wide_rows_test()
+
+    def _populate_mv_after_insert_wide_rows_test(self, slow_propagation=False):
         """Test that a view is OK when created with existing data with wide rows"""
 
-        session = self.prepare(consistency_level=ConsistencyLevel.QUORUM)
+        # Set batchlog.replay_timeout_seconds=1 so we can ensure batchlog will be replayed below
+        jvm_args = ["-Dcassandra.batchlog.replay_timeout_in_ms=1"] if slow_propagation else None
+        session = self.prepare(consistency_level=ConsistencyLevel.QUORUM,
+                               install_byteman=slow_propagation,
+                               jvm_args=jvm_args)
+
+        node2 = self.cluster.nodelist()[1]
+        if slow_propagation:
+            self.ignore_log_patterns = ['UnknownColumnFamilyException']
+            if self.cluster.version() >= '4':
+                node2.byteman_submit(['./byteman/4.0/sleep_on_add_view.btm'])
+                node2.byteman_submit(['./byteman/4.0/sleep_on_add_view.btm'])
+            else:
+                node2.byteman_submit(['./byteman/pre4.0/sleep_on_add_view.btm'])
+                node2.byteman_submit(['./byteman/pre4.0/sleep_on_add_view.btm'])
+
+        debug("Creating table and inserting data")
 
         session.execute("CREATE TABLE t (id int, v int, PRIMARY KEY (id, v))")
 
         for i in xrange(5):
             for j in xrange(10000):
                 session.execute("INSERT INTO t (id, v) VALUES ({}, {})".format(i, j))
+
+        debug("Creating view")
 
         session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t WHERE v IS NOT NULL "
                          "AND id IS NOT NULL PRIMARY KEY (v, id)"))
