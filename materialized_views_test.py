@@ -1085,7 +1085,7 @@ class TestMaterializedViews(Tester):
         session.execute("CREATE TABLE t (id int PRIMARY KEY, v int, v2 text, v3 decimal)")
 
         debug("Inserting initial data")
-        for i in xrange(10000):
+        for i in xrange(5000):
             session.execute("INSERT INTO t (id, v, v2, v3) VALUES ({v}, {v}, 'a', 3.0) IF NOT EXISTS".format(v=i))
 
         debug("Slowing down MV build with byteman")
@@ -1095,6 +1095,9 @@ class TestMaterializedViews(Tester):
         debug("Create a MV")
         session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t "
                          "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v, id)"))
+
+        debug("Wait and ensure the MV build has started. Waiting up to 2 minutes.")
+        self._wait_for_view_build_start(session, 'ks', 't_by_v', wait_minutes=2)
 
         debug("Drop the MV while it is still building")
         session.execute("DROP MATERIALIZED VIEW t_by_v")
@@ -1119,7 +1122,7 @@ class TestMaterializedViews(Tester):
 
         debug("Verify that the MV has been successfully created")
         self._wait_for_view('ks', 't_by_v')
-        assert_one(session, "SELECT COUNT(*) FROM t_by_v", [10000])
+        assert_one(session, "SELECT COUNT(*) FROM t_by_v", [5000])
 
     @since('4.0')
     def test_drop_with_stopped_build(self):
@@ -1130,7 +1133,7 @@ class TestMaterializedViews(Tester):
         nodes = self.cluster.nodelist()
 
         debug("Inserting initial data")
-        for i in xrange(10000):
+        for i in xrange(5000):
             session.execute("INSERT INTO t (id, v, v2, v3) VALUES ({v}, {v}, 'a', 3.0) IF NOT EXISTS".format(v=i))
 
         debug("Slowing down MV build with byteman")
@@ -1140,6 +1143,9 @@ class TestMaterializedViews(Tester):
         debug("Create a MV")
         session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t "
                          "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v, id)"))
+
+        debug("Wait and ensure the MV build has started. Waiting up to 2 minutes.")
+        self._wait_for_view_build_start(session, 'ks', 't_by_v', wait_minutes=2)
 
         debug("Stopping all running view build tasks with nodetool")
         for node in nodes:
@@ -1175,7 +1181,7 @@ class TestMaterializedViews(Tester):
 
         debug("Verify that the MV has been successfully created")
         self._wait_for_view('ks', 't_by_v')
-        assert_one(session, "SELECT COUNT(*) FROM t_by_v", [10000])
+        assert_one(session, "SELECT COUNT(*) FROM t_by_v", [5000])
 
     @since('4.0')
     def test_resume_stopped_build(self):
