@@ -179,6 +179,17 @@ class TestMaterializedViews(Tester):
                 result = list(node_session.execute("SELECT count(*) FROM system.batches;"))
                 self.assertEqual(result[0].count, 0)
 
+            # Extra protection against failed batches is only available on 4.0+
+            if self.cluster.version() >= '4':
+                failed_batches = node.grep_log(r'Failed replaying a batched mutation to \[\/(.*)\]', filename='debug.log')
+                failed_nodes = set()
+                for failed_batch in failed_batches:
+                    failed_nodes.add(failed_batch[1].group(1))
+                for failed_node in failed_nodes:
+                    debug("Waiting for hints to be replayed to node {}".format(failed_node))
+                    node.watch_log_for('Finished hinted handoff .* to endpoint \/{}'.format(failed_node), filename='debug.log')
+
+
     def create_test(self):
         """Test the materialized view creation"""
 
