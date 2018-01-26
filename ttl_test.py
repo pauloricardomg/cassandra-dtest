@@ -1,7 +1,9 @@
+import os
 import time
 from collections import OrderedDict
+from distutils import dir_util
 
-from cassandra import ConsistencyLevel
+from cassandra import ConsistencyLevel, InvalidRequest
 from cassandra.query import SimpleStatement
 from cassandra.util import sortedset
 
@@ -9,6 +11,8 @@ from dtest import Tester, debug, create_ks
 from tools.assertions import (assert_all, assert_almost_equal, assert_none,
                               assert_row_count, assert_unavailable)
 from tools.decorators import since
+
+from scrub_test import TestHelper
 
 
 @since('2.0')
@@ -340,6 +344,77 @@ class TestTTL(Tester):
         self.session1.execute("delete from session where id = 'abc' if usr ='abc'")
         assert_row_count(self.session1, 'session', 0)
 
+    @since('2.1')
+    def expiration_overflow_policy_cap_test(self):
+        self._base_expiration_overflow_policy_test(default_ttl=False, policy='CAP')
+
+    @since('2.1')
+    def expiration_overflow_policy_cap_default_ttl_test(self):
+        self._base_expiration_overflow_policy_test(default_ttl=False, policy='CAP')
+
+    @since('3.0')
+    def expiration_overflow_policy_capnowarn_test(self):
+        self._base_expiration_overflow_policy_test(default_ttl=False, policy='CAP_NOWARN')
+
+    @since('3.0')
+    def expiration_overflow_policy_capnowarn_default_ttl_test(self):
+        self._base_expiration_overflow_policy_test(default_ttl=False, policy='CAP_NOWARN')
+
+    @since('2.1')
+    def expiration_overflow_policy_reject_test(self):
+        self._base_expiration_overflow_policy_test(default_ttl=False, policy='REJECT')
+
+    @since('2.1')
+    def expiration_overflow_policy_reject_default_ttl_test(self):
+        self._base_expiration_overflow_policy_test(default_ttl=False, policy='REJECT')
+
+    def _base_expiration_overflow_policy_test(self, default_ttl, policy):
+        """
+        Checks that expiration date overflow policy is correctly applied
+        @jira_ticket CASSANDRA-14092
+        """
+        MAX_TTL = 20 * 365 * 24 * 60 * 60  # 20 years in seconds
+        default_time_to_live = MAX_TTL if default_ttl else None
+        self.prepare(default_time_to_live=default_time_to_live)
+
+        # Restart node with expiration_date_overflow_policy
+        self.cluster.stop()
+        self.cluster.start(jvm_args=['-Dcassandra.expiration_date_overflow_policy={}'.format(policy)], wait_for_binary_proto=True)
+        self.session1 = self.patient_cql_connection(self.cluster.nodelist()[0])
+        self.session1.execute("USE ks;")
+
+        # Try to insert data, should only fail if policy is REJECT
+        query = 'INSERT INTO ttl_table (key, col1) VALUES (%d, %d)' % (1, 1)
+        if not default_time_to_live:
+            query = query + "USING TTL %d" % (MAX_TTL)
+        try:
+            result = self.session1.execute_async(query + ";")
+            result.result()
+            if policy == 'REJECT':
+                self.fail("should throw InvalidRequest")
+            if self.cluster.version() >= '3.0':  # client warn only on 3.0+
+                if policy == 'CAP':
+                    debug("Warning is " + result.warnings[0])
+                    self.assertTrue('exceeds maximum supported expiration' in result.warnings[0], 'Warning not found')
+                else:
+                    self.assertFalse(result.warnings, "There should be no warnings")
+
+        except InvalidRequest, e:
+            if policy != 'REJECT':
+                self.fail("should not throw InvalidRequest")
+
+        self.cluster.flush()
+        # Data should be present unless policy is reject
+        assert_row_count(self.session1, 'ttl_table', 0 if policy == 'REJECT' else 1)
+
+        # Check that warning was logged iff policy is CAP
+        if policy != 'REJECT':
+            node1 = self.cluster.nodelist()[0]
+            prefix = 'default ' if default_ttl else ''
+            warning = node1.grep_log("Request on table {}.{} with {}ttl of {} seconds exceeds maximum supported expiration"
+                                     .format('ks', 'ttl_table', prefix, MAX_TTL))
+            self.assertTrue(warning, 'Log message should be print for CAP and CAP_NOWARN policy')
+
 
 class TestDistributedTTL(Tester):
     """ Test Time To Live Feature in a distributed environment """
@@ -489,3 +564,58 @@ class TestDistributedTTL(Tester):
         ttl_session2 = session2.execute('SELECT ttl(col1) FROM ttl_table;')
         ttl_session1 = ttl_session1[0][0] - (time.time() - ttl_start)
         assert_almost_equal(ttl_session1, ttl_session2[0][0], error=0.005)
+
+
+class TestRecoverNegativeExpirationDate(TestHelper):
+
+    @since('3.0', max_version='3.99')
+    def recover_negative_expiration_date_sstables_with_scrub(self):
+        """
+        @jira_ticket CASSANDRA-14092
+        Check that row with negative overflowed ttl is recovered by offline scrub
+        """
+        cluster = self.cluster
+        cluster.populate(1).start(wait_for_binary_proto=True)
+        [node] = cluster.nodelist()
+
+        session = self.patient_cql_connection(node)
+        create_ks(session, 'ks', 1)
+        session.execute("DROP TABLE IF EXISTS ttl_table;")
+        query = """
+            CREATE TABLE ttl_table (
+                key int primary key,
+                col1 int,
+                col2 int,
+                col3 int,
+            )
+        """
+        session.execute(query)
+
+        version = '3.0' if self.cluster.version() >= '3.0' and self.cluster.version() < '3.11' else '3.11'
+        corrupt_sstable_dir = os.path.join('sstables', 'ttl_test', version)
+        table_dir = self.get_table_paths('ttl_table')[0]
+        debug("Copying sstables from {} into {}".format(corrupt_sstable_dir, table_dir))
+        dir_util.copy_tree(corrupt_sstable_dir, table_dir)
+
+        debug("Load corrupted sstable")
+        node.nodetool('refresh ks ttl_table')
+        node.watch_log_for('Loading new SSTables and building secondary indexes for ks/ttl_table', timeout=10)
+
+        debug("Check that there are no rows present")
+        assert_row_count(session, 'ttl_table', 0)
+
+        debug("Shutting down node")
+        self.cluster.stop()
+
+        debug("Will run offline scrub on sstable")
+        scrubbed_sstables = self.standalonescrub('ttl_table')
+
+        debug("Executed offline scrub on" + str(scrubbed_sstables))
+
+        debug("Starting node again")
+        self.cluster.start(wait_for_binary_proto=True)
+        session = self.patient_cql_connection(node)
+        session.execute("USE ks;")
+
+        debug("Check that row was recovered")
+        assert_row_count(session, 'ttl_table', 1)
