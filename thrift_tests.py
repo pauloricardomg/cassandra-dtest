@@ -26,6 +26,8 @@ from thrift_bindings.v22.Cassandra import (CfDef, Column, ColumnDef,
 from tools.assertions import assert_all, assert_none, assert_one
 from tools.decorators import since
 
+MAX_TTL = 20 * 365 * 24 * 60 * 60  # 20 years in seconds
+
 
 def get_thrift_client(host='127.0.0.1', port=9160):
     socket = TSocket.TSocket(host, port)
@@ -98,7 +100,10 @@ class ThriftTester(ReusableClusterTester):
         if DISABLE_VNODES:
             node1.set_configuration_options(values={'initial_token': "a".encode('hex')})
 
-        cluster.start(wait_for_binary_proto=True)
+        # CASSANDRA-14092 - prevent max ttl tests from failing
+        cluster.start(jvm_args=['-Dcassandra.expiration_date_overflow_policy=CAP',
+                                '-Dcassandra.expiration_overflow_warning_interval_minutes=0'],
+                      wait_for_binary_proto=True)
         cluster.nodelist()[0].watch_log_for("Listening for thrift clients")  # Wait for the thrift port to open
         time.sleep(0.1)
         cls.client = get_thrift_client()
@@ -129,7 +134,8 @@ class ThriftTester(ReusableClusterTester):
             Cassandra.CfDef('Keyspace1', 'Indexed2', comparator_type='TimeUUIDType', column_metadata=[Cassandra.ColumnDef(uuid.UUID('00000000-0000-1000-0000-000000000000').bytes, 'LongType', Cassandra.IndexType.KEYS)]),
             Cassandra.CfDef('Keyspace1', 'Indexed3', comparator_type='TimeUUIDType', column_metadata=[Cassandra.ColumnDef(uuid.UUID('00000000-0000-1000-0000-000000000000').bytes, 'UTF8Type', Cassandra.IndexType.KEYS)]),
             Cassandra.CfDef('Keyspace1', 'Indexed4', column_metadata=[Cassandra.ColumnDef('a', 'LongType', Cassandra.IndexType.KEYS, 'a_index'), Cassandra.ColumnDef('z', 'UTF8Type')]),
-            Cassandra.CfDef('Keyspace1', 'Expiring', default_time_to_live=2)
+            Cassandra.CfDef('Keyspace1', 'Expiring', default_time_to_live=2),
+            Cassandra.CfDef('Keyspace1', 'ExpiringMaxTTL', default_time_to_live=MAX_TTL)
         ])
 
         keyspace2 = Cassandra.KsDef('Keyspace2', 'org.apache.cassandra.locator.SimpleStrategy', {'replication_factor': '1'},
@@ -1985,13 +1991,36 @@ class TestMutations(ThriftTester):
         assert 'Standard1' in [x.name for x in ks1.cf_defs]
 
     def test_insert_ttl(self):
-        """ Test simple insertion of a column with ttl """
-        _set_keyspace('Keyspace1')
-        self.truncate_all('Standard1')
+        self._base_insert_ttl()
 
-        column = Column('cttl1', 'value1', 0, 5)
-        client.insert('key1', ColumnParent('Standard1'), column, ConsistencyLevel.ONE)
-        assert client.get('key1', ColumnPath('Standard1', column='cttl1'), ConsistencyLevel.ONE).column == column
+    def test_insert_max_ttl(self):
+        self._base_insert_ttl(ttl=MAX_TTL, max_default_ttl=False)
+
+    def test_insert_max_default_ttl(self):
+        self._base_insert_ttl(ttl=None, max_default_ttl=True)
+
+    def _base_insert_ttl(self, ttl=5, max_default_ttl=False):
+
+        """ Test simple insertion of a column with max ttl """
+        _set_keyspace('Keyspace1')
+        cf = 'ExpiringMaxTTL' if max_default_ttl else 'Standard1'
+        logprefix = 'default ' if max_default_ttl else ''
+        self.truncate_all(cf)
+
+        node1 = self.cluster.nodelist()[0]
+        mark = node1.mark_log()
+
+        column = Column('cttl1', 'value1', 0, ttl) if ttl else Column('cttl1', 'value1', 0)
+        expected = Column('cttl1', 'value1', 0, MAX_TTL) if max_default_ttl else column
+
+        client.insert('key1', ColumnParent(cf), column, ConsistencyLevel.ONE)
+        assert client.get('key1', ColumnPath(cf, column='cttl1'), ConsistencyLevel.ONE).column == expected
+
+        if ttl and ttl < MAX_TTL:
+            self.assertFalse(node1.grep_log("exceeds maximum supported expiration", from_mark=mark), "Should not print max expiration date exceeded warning")
+        else:
+            warning = node1.watch_log_for("Request on table {}.{} with {}ttl of {} seconds exceeds maximum supported expiration"
+                                          .format('Keyspace1', cf, logprefix, MAX_TTL), timeout=10)
 
     def test_simple_expiration(self):
         """ Test that column ttled do expires """
