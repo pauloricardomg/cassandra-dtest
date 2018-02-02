@@ -407,7 +407,7 @@ class TestTTL(Tester):
         # Data should be present unless policy is reject
         assert_row_count(self.session1, 'ttl_table', 0 if policy == 'REJECT' else 1)
 
-        # Check that warning was logged iff policy is CAP
+        # Check that warning is always logged, unless policy is REJECT
         if policy != 'REJECT':
             node1 = self.cluster.nodelist()[0]
             prefix = 'default ' if default_ttl else ''

@@ -2005,15 +2005,17 @@ class TestMutations(ThriftTester):
         logprefix = 'default ' if max_default_ttl else ''
         self.truncate_all(cf)
 
+        node1 = self.cluster.nodelist()[0]
+        mark = node1.mark_log()
+
         column = Column('cttl1', 'value1', 0, ttl) if ttl else Column('cttl1', 'value1', 0)
         expected = Column('cttl1', 'value1', 0, MAX_TTL) if max_default_ttl else column
 
         client.insert('key1', ColumnParent(cf), column, ConsistencyLevel.ONE)
         assert client.get('key1', ColumnPath(cf, column='cttl1'), ConsistencyLevel.ONE).column == expected
 
-        node1 = self.cluster.nodelist()[0]
         if ttl and ttl < MAX_TTL:
-            self.assertFalse(node1.grep_log("exceeds maximum supported expiration"), "Should not print max expiration date exceeded warning")
+            self.assertFalse(node1.grep_log("exceeds maximum supported expiration", from_mark=mark), "Should not print max expiration date exceeded warning")
         else:
             warning = node1.watch_log_for("Request on table {}.{} with {}ttl of {} seconds exceeds maximum supported expiration"
                                           .format('Keyspace1', cf, logprefix, MAX_TTL), timeout=10)
