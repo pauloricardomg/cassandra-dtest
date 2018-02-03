@@ -101,7 +101,9 @@ class ThriftTester(ReusableClusterTester):
             node1.set_configuration_options(values={'initial_token': "a".encode('hex')})
 
         # CASSANDRA-14092 - prevent max ttl tests from failing
-        cluster.start(jvm_args=['-Dcassandra.expiration_date_overflow_policy=CAP'], wait_for_binary_proto=True)
+        cluster.start(jvm_args=['-Dcassandra.expiration_date_overflow_policy=CAP',
+                                '-Dcassandra.expiration_overflow_warning_interval_minutes=0'],
+                      wait_for_binary_proto=True)
         cluster.nodelist()[0].watch_log_for("Listening for thrift clients")  # Wait for the thrift port to open
         time.sleep(0.1)
         cls.client = get_thrift_client()
