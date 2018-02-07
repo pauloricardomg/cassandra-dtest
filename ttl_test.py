@@ -618,4 +618,4 @@ class TestRecoverNegativeExpirationDate(TestHelper):
         session.execute("USE ks;")
 
         debug("Check that row was recovered")
-        assert_row_count(session, 'ttl_table', 1)
+        assert_all(session, "SELECT * FROM ttl_table;", [[1, 1, None, None]])
