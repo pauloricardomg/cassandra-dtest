@@ -568,7 +568,7 @@ class TestDistributedTTL(Tester):
 
 class TestRecoverNegativeExpirationDate(TestHelper):
 
-    @since('3.0', max_version='3.99')
+    @since('2.1', max_version='3.99')
     def recover_negative_expiration_date_sstables_with_scrub(self):
         """
         @jira_ticket CASSANDRA-14092
@@ -599,7 +599,7 @@ class TestRecoverNegativeExpirationDate(TestHelper):
 
         debug("Load corrupted sstable")
         node.nodetool('refresh ks ttl_table')
-        node.watch_log_for('Loading new SSTables and building secondary indexes for ks/ttl_table', timeout=10)
+        node.watch_log_for('Loading new SSTables', timeout=10)
 
         debug("Check that there are no rows present")
         assert_row_count(session, 'ttl_table', 0)
@@ -608,7 +608,7 @@ class TestRecoverNegativeExpirationDate(TestHelper):
         self.cluster.stop()
 
         debug("Will run offline scrub on sstable")
-        scrubbed_sstables = self.standalonescrub('ttl_table')
+        scrubbed_sstables = self.launch_standalone_scrub('ks', 'ttl_table', reinsert_overflowed_ttl=True)
 
         debug("Executed offline scrub on" + str(scrubbed_sstables))
 
