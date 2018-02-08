@@ -2,6 +2,7 @@ import os
 import time
 from collections import OrderedDict
 from distutils import dir_util
+from distutils.version import LooseVersion
 
 from cassandra import ConsistencyLevel, InvalidRequest
 from cassandra.query import SimpleStatement
@@ -568,7 +569,7 @@ class TestDistributedTTL(Tester):
 
 class TestRecoverNegativeExpirationDate(TestHelper):
 
-    @since('2.1', max_version='3.99')
+    @since('2.1')
     def recover_negative_expiration_date_sstables_with_scrub(self):
         """
         @jira_ticket CASSANDRA-14092
@@ -591,7 +592,9 @@ class TestRecoverNegativeExpirationDate(TestHelper):
         """
         session.execute(query)
 
-        version = '3.0' if self.cluster.version() >= '3.0' and self.cluster.version() < '3.11' else '3.11'
+        version = '2.1' if self.cluster.version() < LooseVersion('3.0') else \
+                  ('3.0' if self.cluster.version() < LooseVersion('3.11') else '3.11')
+
         corrupt_sstable_dir = os.path.join('sstables', 'ttl_test', version)
         table_dir = self.get_table_paths('ttl_table')[0]
         debug("Copying sstables from {} into {}".format(corrupt_sstable_dir, table_dir))
@@ -608,7 +611,9 @@ class TestRecoverNegativeExpirationDate(TestHelper):
         self.cluster.stop()
 
         debug("Will run offline scrub on sstable")
-        scrubbed_sstables = self.launch_standalone_scrub('ks', 'ttl_table', reinsert_overflowed_ttl=True)
+        scrubbed_sstables = self.launch_standalone_scrub('ks', 'ttl_table',
+                                                         reinsert_overflowed_ttl=True,
+                                                         no_validate=True)
 
         debug("Executed offline scrub on" + str(scrubbed_sstables))
 
