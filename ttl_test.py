@@ -570,7 +570,7 @@ class TestDistributedTTL(Tester):
 class TestRecoverNegativeExpirationDate(TestHelper):
 
     @since('2.1')
-    def recover_negative_expiration_date_sstables_with_scrub(self):
+    def recover_negative_expiration_date_sstables_with_scrub_test(self):
         """
         @jira_ticket CASSANDRA-14092
         Check that row with negative overflowed ttl is recovered by offline scrub
