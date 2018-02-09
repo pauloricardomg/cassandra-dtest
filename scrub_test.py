@@ -119,7 +119,7 @@ class TestHelper(Tester):
             args += ['--reinsert-overflowed-ttl']
         if no_validate:
             args += ['--no-validate']
-        args += [ks, cf] if reinsert_overflowed_ttl else [scrub_bin, ks, cf]
+        args += [ks, cf] if reinsert_overflowed_ttl else [ks, cf]
         p = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out, err = p.communicate()
         debug(out)
