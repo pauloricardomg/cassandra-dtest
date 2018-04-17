@@ -528,6 +528,26 @@ class TestBootstrap(Tester):
         node4.start(wait_other_notice=True)
         node4.watch_log_for("JOINING:", from_mark=mark)
 
+    def test_broken_bootstrap(self):
+        cluster = self.cluster
+
+        logger.debug("Creating cluster")
+        cluster.populate(3)
+        cluster.start(wait_for_binary_proto=True)
+        node1 = cluster.nodelist()[0]
+
+        logger.debug("Creating and populating table")
+        session = self.patient_cql_connection(node1)
+        create_ks(session, 'ks', 2)
+        session.execute("CREATE TABLE t (id int PRIMARY KEY, v int, v2 text, v3 decimal)")
+        for i in range(10000):
+            session.execute("INSERT INTO t (id, v, v2, v3) VALUES ({v}, {v}, 'a', 3.0) IF NOT EXISTS".format(v=i))
+
+        logger.debug("Bootstrapping new node")
+        node4 = new_node(self.cluster)
+        node4.start(wait_for_binary_proto=True, wait_other_notice=True)
+        assert_bootstrap_state(self, node4, 'COMPLETED')
+
     def test_decommissioned_wiped_node_can_gossip_to_single_seed(self):
         """
         @jira_ticket CASSANDRA-8072
