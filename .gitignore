@@ -3,10 +3,10 @@
 *.iws
 *.ipr
 *.iml
-
 *.pyc
 logs
 last_test_dir
 upgrade
 html/
 doxygen/doxypy-0.4.2/
+.pytest_cache/
