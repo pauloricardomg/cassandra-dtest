@@ -410,13 +410,17 @@ def pytest_collection_modifyitems(items, config):
     This function is called upon during the pytest test collection phase and allows for modification
     of the test items within the list
     """
-    if not config.getoption("--collect-only") and config.getoption("--cassandra-dir") is None:
+    cassandra_dir = config.getoption("--cassandra-dir") or config.inicfg.get("cassandra_dir")
+    if cassandra_dir is not None:
+        cassandra_dir = os.path.expanduser(cassandra_dir)
+    if not config.getoption("--collect-only") and cassandra_dir is None:
         if config.getoption("--cassandra-version") is None:
-            raise Exception("Required dtest arguments were missing! You must provide either --cassandra-dir "
-                            "or --cassandra-version. Refer to the documentation or invoke the help with --help.")
+            raise Exception("Required dtest arguments were missing! You must provide either --cassandra-dir or "
+                            "--cassandra-version command line options or set cassandra_dir property on pytest.ini. "
+                            "Refer to the documentation or invoke the help with --help.")
 
     # Either cassandra_version or cassandra_dir is defined, so figure out the version
-    CASSANDRA_VERSION = config.getoption("--cassandra-version") or get_version_from_build(config.getoption("--cassandra-dir"))
+    CASSANDRA_VERSION = config.getoption("--cassandra-version") or get_version_from_build(cassandra_dir)
 
     # Check that use_off_heap_memtables is supported in this c* version
     if config.getoption("--use-off-heap-memtables") and ("3.0" <= CASSANDRA_VERSION < "3.4"):
