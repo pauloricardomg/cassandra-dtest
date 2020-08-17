@@ -42,6 +42,8 @@ PARTITIONERS = {
     "order": "org.apache.cassandra.dht.OrderPreservingPartitioner"
 }
 
+PARTITIONERS_ALLOCATE_TOKENS_FOR_RF = ["murmur3", "random"]
+
 
 class TestCqlshCopy(Tester):
     """
@@ -98,6 +100,9 @@ class TestCqlshCopy(Tester):
                     configuration_options = {'authenticator': 'org.apache.cassandra.auth.PasswordAuthenticator'}
                 else:
                     configuration_options['authenticator'] = 'org.apache.cassandra.auth.PasswordAuthenticator'
+
+            if partitioner not in PARTITIONERS_ALLOCATE_TOKENS_FOR_RF:
+                configuration_options = {'allocate_tokens_for_local_replication_factor': None}
 
             if configuration_options:
                 self.cluster.set_configuration_options(values=configuration_options)

@@ -482,7 +482,8 @@ class TestBootstrap(Tester):
 
             node3 = new_node(cluster, data_center='dc2')
             node3.start(jvm_args=["-Dcassandra.write_survey=true"], no_wait=True)
-            time.sleep(5)
+            
+            time.sleep(15)
 
 
             ntout = node1.nodetool('status').stdout
@@ -769,6 +770,7 @@ class TestBootstrap(Tester):
         node2.start()
 
         node3 = new_node(cluster, remote_debug_port='2003')
+        time.sleep(10)
         try:
             node3.start(wait_other_notice=False, verbose=False)
         except NodeError:

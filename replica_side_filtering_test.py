@@ -522,7 +522,8 @@ class TestAllowFiltering(ReplicaSideFiltering):
                                                   'num_tokens': 1,
                                                   'commitlog_sync_period_in_ms': 500,
                                                   'enable_transient_replication': True,
-                                                  'partitioner': 'org.apache.cassandra.dht.OrderPreservingPartitioner'})
+                                                  'partitioner': 'org.apache.cassandra.dht.OrderPreservingPartitioner',
+                                                  'allocate_tokens_for_local_replication_factor': None})
         cluster.set_batch_commitlog(enabled=True)
         cluster.populate(2, tokens=[0, 1], debug=True, install_byteman=True)
         node1, node2 = cluster.nodelist()

@@ -179,7 +179,7 @@ class TestCommitLog(Tester):
 
         node1 = self.node1
         node1.set_batch_commitlog(enabled=True)
-        node1.start()
+        node1.start(wait_for_binary_proto=True)
         session = self.patient_cql_connection(node1)
 
         logger.debug("Creating schema")
@@ -238,7 +238,7 @@ class TestCommitLog(Tester):
         """
         node1 = self.node1
         node1.set_batch_commitlog(enabled=True)
-        node1.start()
+        node1.start(wait_for_binary_proto=True)
 
         logger.debug("Insert data")
         session = self.patient_cql_connection(node1)
