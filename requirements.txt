@@ -1,7 +1,7 @@
 -e git+https://github.com/datastax/python-driver.git@cassandra-test#egg=cassandra-driver
 # Used ccm version is tracked by cassandra-test branch in ccm repo. Please create a PR there for fixes or upgrades to new releases.
 # Run the tests with a patched CCM for CASSANDRA-13701 (pauloricardomg)
--e git+https://github.com/pauloricardomg/ccm.git@CASSANDRA-13701#egg=ccm
+-e git+https://github.com/pauloricardomg/ccm.git@CASSANDRA-13701-v4#egg=ccm
 decorator
 docopt
 enum34
